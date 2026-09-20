@@ -1,0 +1,305 @@
+import Cocoa
+import CoreGraphics
+import UniformTypeIdentifiers
+
+// ── 工具 ────────────────────────────────────────────────
+func runCmd(_ path: String, _ args: [String]) -> String {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: path)
+    p.arguments = args
+    let pipe = Pipe()
+    p.standardOutput = pipe
+    p.standardError = pipe
+    do { try p.run() } catch { return "ERR \(error)" }
+    p.waitUntilExit()
+    let d = pipe.fileHandleForReading.readDataToEndOfFile()
+    return String(data: d, encoding: .utf8) ?? ""
+}
+
+func listPrinters() -> [String] {
+    var res: [String] = []
+    for line in runCmd("/usr/bin/lpstat", ["-p"]).split(separator: "\n") {
+        var rest: Substring
+        if line.hasPrefix("printer ") { rest = line.dropFirst(8) }
+        else if line.hasPrefix("打印机") { rest = line.dropFirst(3) }
+        else { continue }
+        let ascii = String(rest.prefix { $0.isASCII })
+        if let n = ascii.split(separator: " ").first, !n.isEmpty { res.append(String(n)) }
+    }
+    return res
+}
+
+// ── 核心：每页按百分比缩放、居中放到 A4 ──────────────────
+let A4W: CGFloat = 595.276
+let A4H: CGFloat = 841.89
+
+func scaledPDF(input: URL, outDir: URL, percent: CGFloat, fit: Bool) -> URL? {
+    guard let src = CGPDFDocument(input as CFURL) else { return nil }
+    try? FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
+    let tag = fit ? "fit" : "raw"
+    let name = input.deletingPathExtension().lastPathComponent + "-x\(Int(percent * 100))-\(tag).pdf"
+    let outURL = outDir.appendingPathComponent(name)
+    var box = CGRect(x: 0, y: 0, width: A4W, height: A4H)
+    guard let ctx = CGContext(outURL as CFURL, mediaBox: &box, nil) else { return nil }
+    for i in 1...src.numberOfPages {
+        guard let page = src.page(at: i) else { continue }
+        let c = page.getBoxRect(.cropBox)
+        let k = fit ? min(A4W / c.width, A4H / c.height) : 1.0
+        let s = percent * k
+        ctx.beginPDFPage(nil)
+        ctx.saveGState()
+        ctx.translateBy(x: (A4W - c.width * s) / 2 - c.minX * s,
+                        y: (A4H - c.height * s) / 2 - c.minY * s)
+        ctx.scaleBy(x: s, y: s)
+        ctx.drawPDFPage(page)
+        ctx.restoreGState()
+        ctx.endPDFPage()
+    }
+    ctx.closePDF()
+    return outURL
+}
+
+// ── 拖拽接收 ────────────────────────────────────────────
+final class DropView: NSView {
+    var onDrop: (([URL]) -> Void)?
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        registerForDraggedTypes([.fileURL])
+    }
+    required init?(coder: NSCoder) { super.init(coder: coder) }
+    override func draggingEntered(_ s: NSDraggingInfo) -> NSDragOperation { .copy }
+    override func performDragOperation(_ s: NSDraggingInfo) -> Bool {
+        guard let urls = s.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] else { return false }
+        var pdfs: [URL] = []
+        for u in urls {
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: u.path, isDirectory: &isDir), isDir.boolValue {
+                let inner = (try? FileManager.default.contentsOfDirectory(at: u, includingPropertiesForKeys: nil)) ?? []
+                pdfs += inner.filter { $0.pathExtension.lowercased() == "pdf" }
+            } else if u.pathExtension.lowercased() == "pdf" {
+                pdfs.append(u)
+            }
+        }
+        guard !pdfs.isEmpty else { return false }
+        onDrop?(pdfs)
+        return true
+    }
+}
+
+// ── 主界面 ──────────────────────────────────────────────
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    var window: NSWindow!
+    var files: [URL] = []
+    let listView = NSTextView()
+    let pctLabel = NSTextField(labelWithString: "80%")
+    let slider = NSSlider(value: 80, minValue: 50, maxValue: 100, target: nil, action: nil)
+    let popup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 240, height: 25), pullsDown: false)
+    let duplexBox = NSButton(checkboxWithTitle: "双面打印（长边翻页）", target: nil, action: nil)
+    let fitBox = NSButton(checkboxWithTitle: "先铺满 A4 再缩放（推荐，装订留白）", target: nil, action: nil)
+    let status = NSTextField(labelWithString: "把 PDF 拖进窗口，或点「添加 PDF」")
+
+    func setStatus(_ s: String) { status.stringValue = s }
+
+    func refreshList() {
+        let lines = files.map { u -> String in
+            let pages = CGPDFDocument(u as CFURL)?.numberOfPages ?? 0
+            return "• \(u.lastPathComponent)   (\(pages) 页)"
+        }
+        listView.string = lines.isEmpty ? "（还没有文件）" : lines.joined(separator: "\n")
+    }
+
+    func addFiles(_ urls: [URL]) {
+        for u in urls where !files.contains(u) { files.append(u) }
+        refreshList()
+        setStatus("\(files.count) 个文件待打印")
+    }
+
+    func applicationDidFinishLaunching(_ n: Notification) {
+        let drop = DropView(frame: NSRect(x: 0, y: 0, width: 680, height: 452))
+        drop.onDrop = { [weak self] urls in self?.addFiles(urls) }
+
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 452),
+                          styleMask: [.titled, .closable, .miniaturizable, .resizable],
+                          backing: .buffered, defer: false)
+        window.title = "批量打印 PDF"
+        window.contentView = drop
+        window.center()
+
+        let title = NSTextField(labelWithString: "批量打印 PDF")
+        title.font = NSFont.boldSystemFont(ofSize: 16)
+        let hint = NSTextField(labelWithString: "把 PDF 文件（或整个文件夹）拖进窗口，或点「添加 PDF」。默认 80% 缩放，留出装订边。")
+        hint.font = NSFont.systemFont(ofSize: 11)
+        hint.textColor = .secondaryLabelColor
+
+        listView.isEditable = false
+        listView.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        listView.backgroundColor = .textBackgroundColor
+        let scroll = NSScrollView()
+        scroll.documentView = listView
+        scroll.hasVerticalScroller = true
+        scroll.borderType = .bezelBorder
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        scroll.heightAnchor.constraint(equalToConstant: 195).isActive = true
+
+        slider.target = self
+        slider.action = #selector(onSlider)
+        slider.translatesAutoresizingMaskIntoConstraints = false
+        slider.widthAnchor.constraint(equalToConstant: 240).isActive = true
+        pctLabel.font = NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .semibold)
+
+        fitBox.state = .on
+        duplexBox.state = .off
+
+        let addBtn = NSButton(title: "添加 PDF", target: self, action: #selector(onAdd))
+        let clearBtn = NSButton(title: "清空", target: self, action: #selector(onClear))
+        let exportBtn = NSButton(title: "导出缩放后的 PDF", target: self, action: #selector(onExport))
+        let printBtn = NSButton(title: "打印", target: self, action: #selector(onPrint))
+        printBtn.keyEquivalent = "\r"
+        printBtn.bezelStyle = .rounded
+
+        popup.removeAllItems()
+        let ps = listPrinters()
+        popup.addItems(withTitles: ps.isEmpty ? ["（未找到打印机）"] : ps)
+        let dOut = runCmd("/usr/bin/lpstat", ["-d"])
+        for name in ps where dOut.contains(name) { popup.selectItem(withTitle: name); break }
+        if ps.count == 1 { popup.selectItem(withTitle: ps[0]) }
+
+        status.font = NSFont.systemFont(ofSize: 11)
+        status.textColor = .secondaryLabelColor
+
+        let stack = NSStackView(views: [
+            title, hint, scroll,
+            row([NSTextField(labelWithString: "缩放比例"), slider, pctLabel]),
+            fitBox,
+            row([NSTextField(labelWithString: "打印机"), popup]),
+            duplexBox,
+            row([addBtn, clearBtn, exportBtn, printBtn]),
+            status,
+        ])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 10
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        drop.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: drop.leadingAnchor, constant: 18),
+            stack.trailingAnchor.constraint(equalTo: drop.trailingAnchor, constant: -18),
+            stack.topAnchor.constraint(equalTo: drop.topAnchor, constant: 16),
+            scroll.widthAnchor.constraint(equalTo: stack.widthAnchor),
+        ])
+
+        let env = ProcessInfo.processInfo.environment
+        if let dir = env["BATCHPRINT_SAMPLE_DIR"] {
+            let u = URL(fileURLWithPath: dir)
+            let inner = (try? FileManager.default.contentsOfDirectory(at: u, includingPropertiesForKeys: nil)) ?? []
+            addFiles(inner.filter { $0.pathExtension.lowercased() == "pdf" }.sorted { $0.lastPathComponent < $1.lastPathComponent })
+        }
+
+func dumpViews(_ v: NSView, _ depth: Int) {
+    let pad = String(repeating: "  ", count: depth)
+    var extra = ""
+    if let tf = v as? NSTextField { extra = " text=\"\(tf.stringValue)\" color=\(tf.textColor?.description ?? "-")" }
+    if let b = v as? NSButton { extra = " title=\"\(b.title)\" state=\(b.state.rawValue) bezel=\(b.bezelStyle.rawValue)" }
+    if let p = v as? NSPopUpButton { extra = " items=\(p.itemTitles) sel=\(p.titleOfSelectedItem ?? "-")" }
+    if let sv = v as? NSScrollView { extra = " clip=\(NSStringFromRect(sv.contentView.bounds))" }
+    print("\(pad)\(type(of: v)) frame=\(NSStringFromRect(v.frame)) hidden=\(v.isHidden) alpha=\(v.alphaValue)\(extra)")
+    for c in v.subviews { dumpViews(c, depth + 1) }
+}
+
+        if let snap = env["BATCHPRINT_SNAPSHOT"] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                drop.layoutSubtreeIfNeeded()
+                if let rep = drop.bitmapImageRepForCachingDisplay(in: drop.bounds) {
+                    drop.cacheDisplay(in: drop.bounds, to: rep)
+                    try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: snap))
+                if env["BATCHPRINT_DUMP"] != nil { dumpViews(drop, 0) }
+                }
+                NSApp.terminate(nil)
+            }
+        }
+        window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        refreshList()
+    }
+
+    func row(_ views: [NSView]) -> NSStackView {
+        let s = NSStackView(views: views)
+        s.orientation = .horizontal
+        s.spacing = 8
+        s.alignment = .centerY
+        return s
+    }
+
+    @objc func onSlider() { pctLabel.stringValue = "\(Int(slider.doubleValue))%" }
+
+    @objc func onAdd() {
+        let p = NSOpenPanel()
+        p.allowsMultipleSelection = true
+        p.canChooseDirectories = true
+        p.allowedContentTypes = [.pdf]
+        if p.runModal() == .OK { addFiles(p.urls) }
+    }
+
+    @objc func onClear() {
+        files = []
+        refreshList()
+        setStatus("已清空")
+    }
+
+    func scaleAll(to dir: URL) -> [URL] {
+        let pct = CGFloat(slider.doubleValue) / 100.0
+        var outs: [URL] = []
+        for f in files {
+            if let o = scaledPDF(input: f, outDir: dir, percent: pct, fit: fitBox.state == .on) { outs.append(o) }
+        }
+        return outs
+    }
+
+    @objc func onExport() {
+        guard !files.isEmpty else { setStatus("先添加 PDF 文件"); return }
+        let p = NSOpenPanel()
+        p.canChooseDirectories = true
+        p.canChooseFiles = false
+        p.prompt = "导出到这里"
+        if p.runModal() != .OK { return }
+        guard let dir = p.urls.first else { return }
+        let outs = scaleAll(to: dir)
+        setStatus("已导出 \(outs.count) 个缩放后的 PDF → \(dir.path)")
+    }
+
+    @objc func onPrint() {
+        guard !files.isEmpty else { setStatus("先添加 PDF 文件"); return }
+        guard let printer = popup.titleOfSelectedItem, !printer.hasPrefix("（") else {
+            setStatus("没找到打印机"); return
+        }
+        setStatus("正在生成缩放版…")
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("batchprint-\(UUID().uuidString)")
+        let outs = scaleAll(to: tmp)
+        guard !outs.isEmpty else { setStatus("缩放失败，检查 PDF 是否损坏"); return }
+        var args = ["-d", printer] + outs.map { $0.path }
+        if duplexBox.state == .on { args += ["-o", "sides=two-sided-long-edge"] }
+        let out = runCmd("/usr/bin/lp", args)
+        let ok = out.lowercased().contains("request id") || out.contains("请求id") || out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        if ok {
+            setStatus("✅ 已发送：\(outs.count) 个文件（\(Int(slider.doubleValue))% 缩放）")
+        } else {
+            setStatus("❌ lp: \(out.prefix(160))")
+        }
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ s: NSApplication) -> Bool { true }
+}
+
+let app = NSApplication.shared
+app.setActivationPolicy(.regular)
+let delegate = AppDelegate()
+app.delegate = delegate
+let menu = NSMenu()
+let appItem = NSMenuItem()
+menu.addItem(appItem)
+let sub = NSMenu()
+sub.addItem(NSMenuItem(title: "退出 批量打印", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+appItem.submenu = sub
+app.mainMenu = menu
+app.run()
