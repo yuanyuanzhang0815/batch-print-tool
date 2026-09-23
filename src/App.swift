@@ -1158,6 +1158,11 @@ struct PreviewPane: View {
 struct BottomBar: View {
     @ObservedObject var model: Model
 
+    /// 版本号从 Info.plist 读，避免「装了新版，界面上看不出来」
+    private var version: String {
+        (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "dev"
+    }
+
     var body: some View {
         HStack(spacing: 10) {
             Text("\(model.items.count) 个文件 · \(model.totalSheets) 页")
@@ -1174,6 +1179,10 @@ struct BottomBar: View {
             }
 
             Spacer()
+            Text("v\(version)")
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+                .help("批量打印工具版本")
             if model.busy { ProgressView().controlSize(.small) }
 
             HoverButton(tip: "只生成缩放后的 PDF，不打印", off: model.items.isEmpty) {
