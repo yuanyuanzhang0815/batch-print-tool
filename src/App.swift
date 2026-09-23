@@ -71,8 +71,29 @@ func pdfOrigin(_ c: CGRect, _ s: CGFloat, _ pg: CGSize, _ m: MarginMode) -> (CGF
     return (dx - c.minX * s, dy - c.minY * s)
 }
 
+// ── 旋转：每个文件独立的 90° 步进，四条流水线（导出 / 打印 / 预览）共用同一套放置数学 ──
+func normRotation(_ r: Int) -> Int { ((r % 360) + 360) % 360 }
+
+/// 旋转后的内容外接盒（90/270 时长宽互换）。缩放与定位都按这个盒子算，
+/// 内容真正绘制时再绕盒子中心旋转，这样缩放 / 纸张 / 页边距三套规则不用为旋转分叉。
+func rotatedBox(_ c: CGRect, _ rotation: Int) -> CGRect {
+    let r = normRotation(rotation)
+    let size = (r == 90 || r == 270) ? CGSize(width: c.height, height: c.width) : c.size
+    return CGRect(origin: .zero, size: size)
+}
+
+func placeContent(_ ctx: CGContext, _ c: CGRect, _ eff: CGRect, _ s: CGFloat,
+                  _ dx: CGFloat, _ dy: CGFloat, _ rotation: Int) {
+    let r = normRotation(rotation)
+    ctx.translateBy(x: dx + eff.width * s / 2, y: dy + eff.height * s / 2)
+    if r != 0 { ctx.rotate(by: CGFloat(r) * .pi / 180) }
+    ctx.scaleBy(x: s, y: s)
+    ctx.translateBy(x: -c.midX, y: -c.midY)
+}
+
 func scaledPDF(input: URL, outDir: URL, mode: ScaleMode, percent: Double, pages: [Int],
-                suffix: String = "", paper: PaperSize, margin: MarginMode) -> URL? {
+                suffix: String = "", paper: PaperSize, margin: MarginMode,
+                rotation: Int = 0) -> URL? {
     guard isSupportedFile(input) else { return nil }
     var src = input
     if isOfficeFile(input) {
@@ -90,13 +111,13 @@ func scaledPDF(input: URL, outDir: URL, mode: ScaleMode, percent: Double, pages:
     if isImageFile(src) {
         guard let img = loadCGImage(src) else { return nil }
         let c = CGRect(origin: .zero, size: imagePoints(src, img))
-        let s = scaleFor(mode, c, percent, pg)
-        let (dx, dy) = pdfOrigin(c, s, pg, margin)
+        let eff = rotatedBox(c, rotation)
+        let s = scaleFor(mode, eff, percent, pg)
+        let (dx, dy) = pdfOrigin(eff, s, pg, margin)
         ctx.interpolationQuality = .high
         ctx.beginPDFPage(nil)
         ctx.saveGState()
-        ctx.translateBy(x: dx, y: dy)
-        ctx.scaleBy(x: s, y: s)
+        placeContent(ctx, c, eff, s, dx, dy, rotation)
         ctx.draw(img, in: c)
         ctx.restoreGState()
         ctx.endPDFPage()
@@ -111,12 +132,12 @@ func scaledPDF(input: URL, outDir: URL, mode: ScaleMode, percent: Double, pages:
     for i in want {
         guard let page = doc.page(at: i) else { continue }
         let c = page.getBoxRect(.cropBox)
-        let s = scaleFor(mode, c, percent, pg)
-        let (dx, dy) = pdfOrigin(c, s, pg, margin)
+        let eff = rotatedBox(c, rotation)
+        let s = scaleFor(mode, eff, percent, pg)
+        let (dx, dy) = pdfOrigin(eff, s, pg, margin)
         ctx.beginPDFPage(nil)
         ctx.saveGState()
-        ctx.translateBy(x: dx, y: dy)
-        ctx.scaleBy(x: s, y: s)
+        placeContent(ctx, c, eff, s, dx, dy, rotation)
         ctx.drawPDFPage(page)
         ctx.restoreGState()
         ctx.endPDFPage()
@@ -219,7 +240,8 @@ func resolvedPDF(_ u: URL) -> URL? {
 
 // ── 预览渲染 ────────────────────────────────────────────
 func renderPage(url: URL, mode: ScaleMode, percent: Double, sourcePage: Int,
-                paper: PaperSize, margin: MarginMode, retina: CGFloat = 3) -> NSImage? {
+                paper: PaperSize, margin: MarginMode, rotation: Int = 0,
+                retina: CGFloat = 3) -> NSImage? {
     let pg = paper.size
     var src = url
     if isOfficeFile(url) {
@@ -236,8 +258,9 @@ func renderPage(url: URL, mode: ScaleMode, percent: Double, sourcePage: Int,
     let c: CGRect = isImg
         ? CGRect(origin: .zero, size: imagePoints(src, img!))
         : pageRef!.getBoxRect(.cropBox)
-    let s = scaleFor(mode, c, percent, pg)
-    let (dx, dy) = pdfOrigin(c, s, pg, margin)
+    let eff = rotatedBox(c, rotation)
+    let s = scaleFor(mode, eff, percent, pg)
+    let (dx, dy) = pdfOrigin(eff, s, pg, margin)
     let w = Int(pg.width * retina), h = Int(pg.height * retina)
     guard let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8,
                               bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
@@ -247,8 +270,7 @@ func renderPage(url: URL, mode: ScaleMode, percent: Double, sourcePage: Int,
     ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
     ctx.fill(CGRect(x: 0, y: 0, width: CGFloat(w), height: CGFloat(h)))
     ctx.scaleBy(x: retina, y: retina)
-    ctx.translateBy(x: dx, y: dy)
-    ctx.scaleBy(x: s, y: s)
+    placeContent(ctx, c, eff, s, dx, dy, rotation)
     if isImg, let img { ctx.draw(img, in: c) } else if let pageRef { ctx.drawPDFPage(pageRef) }
     guard let cg = ctx.makeImage() else { return nil }
     return NSImage(cgImage: cg, size: NSSize(width: pg.width, height: pg.height))
@@ -265,6 +287,7 @@ struct PrintItem: Identifiable {
     var pages: Int
     var range = "全部"
     var copies = 1
+    var rotation = 0          // 0 / 90 / 180 / 270，顺时针为正，逐文件独立
     var status: ItemStatus = .ready
     var name: String { url.lastPathComponent }
     var isImage: Bool { isImageFile(url) }
@@ -400,7 +423,8 @@ final class Model: ObservableObject {
             for copy in 0..<max(1, it.copies) {
                 let suffix = it.copies > 1 ? "-c\(copy + 1)" : ""
                 if let o = scaledPDF(input: it.url, outDir: dir, mode: mode, percent: percent,
-                                     pages: want, suffix: suffix, paper: paper, margin: margin) {
+                                     pages: want, suffix: suffix, paper: paper, margin: margin,
+                                     rotation: it.rotation) {
                     outs.append(o)
                 }
             }
@@ -472,7 +496,7 @@ extension EnvironmentValues {
     }
 }
 
-enum BtnKind { case glyph, quiet, text, cta }
+enum BtnKind { case glyph, quiet, mini, text, cta }
 
 struct HoverButton<Label: View>: View {
     var kind: BtnKind = .text
@@ -525,6 +549,14 @@ struct HoverButton<Label: View>: View {
                     .buttonStyle(.plain)
                     .foregroundStyle(isHot ? Color.primary : Color.secondary)
                     .frame(width: 26, height: 24)
+                    .contentShape(Rectangle())
+            case .mini:   // 行内密集区专用：比 quiet 小一号
+                Button(action: action) { label() }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(isHot ? Color.primary : Color.secondary)
+                    .frame(width: 22, height: 22)
+                    .background(RoundedRectangle(cornerRadius: 5)
+                        .fill(isHot ? Color.primary.opacity(0.10) : .clear))
                     .contentShape(Rectangle())
             }
         }
@@ -583,7 +615,7 @@ func paneTitle(_ t: String) -> some View {
     Text(t).font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
 }
 
-// ── 主界面：文件队列 32% ｜ 打印设置 23% ｜ 预览 45% ─────
+// ── 主界面：文件队列 34% ｜ 打印设置 23% ｜ 预览 43% ─────
 struct ContentView: View {
     var sampleDir: String? = nil
     @StateObject var model = Model()
@@ -595,7 +627,7 @@ struct ContentView: View {
             GeometryReader { geo in
                 HStack(spacing: 0) {
                     FileTable(model: model, reduce: reduce, targeted: targeted)
-                        .frame(width: max(340, geo.size.width * 0.32))
+                        .frame(width: max(340, geo.size.width * 0.34))
                     Hairline()
                     SettingsPanel(model: model)
                         .frame(width: max(272, geo.size.width * 0.23))
@@ -642,6 +674,10 @@ struct ContentView: View {
                 model.items[0].range = "9-2"
                 model.items[1].copies = 3
             }
+            if ProcessInfo.processInfo.environment["BATCHPRINT_DEMO"] == "rotate", !model.items.isEmpty {
+                model.items[0].rotation = 90
+                if model.items.count > 1 { model.items[1].rotation = 270 }
+            }
         }
     }
 }
@@ -663,7 +699,7 @@ struct FileTable: View {
                     Text("清空")
                 }
 
-                HoverButton(tip: "添加 PDF（⌘O，可多选，也可选文件夹）") {
+                HoverButton(tip: "添加文件（⌘O，可多选，也可选文件夹）") {
                     addViaPanel()
                 } label: {
                     Label("添加文件", systemImage: "plus")
@@ -696,11 +732,12 @@ struct FileTable: View {
     private var columns: some View {
         HStack(spacing: 0) {
             Text("文件名").frame(maxWidth: .infinity, alignment: .leading)
-            Text("页数").frame(width: 44, alignment: .center)
-            Text("页码范围").frame(width: 92, alignment: .center)
-            Text("份数").frame(width: 60, alignment: .center)
-            Text("状态").frame(width: 66, alignment: .center)
-            Text("").frame(width: 32)
+            Text("页数").frame(width: 32, alignment: .center)
+            Text("页码范围").frame(width: 74, alignment: .center)
+            Text("旋转").frame(width: 70, alignment: .center)
+            Text("份数").frame(width: 56, alignment: .center)
+            Text("状态").frame(width: 44, alignment: .center)
+            Text("").frame(width: 22)
         }
         .font(.system(size: 11, weight: .medium))
         .foregroundStyle(.secondary)
@@ -749,7 +786,7 @@ struct FileRow: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            HStack(spacing: 8) {
+            HStack(spacing: 6) {
                 Image(systemName: item.isImage ? "photo" : (item.isOffice ? "doc.text" : "doc.richtext"))
                     .font(.system(size: 12))
                     .foregroundStyle(item.isImage
@@ -777,7 +814,7 @@ struct FileRow: View {
                 Text(item.range)
                     .font(.system(size: 12))
                     .lineLimit(1)
-                    .frame(width: 70)
+                    .frame(width: 54)
                     .padding(.vertical, 3)
                     .background(RoundedRectangle(cornerRadius: 5)
                         .fill(Color.primary.opacity(hover ? 0.07 : 0.0)))
@@ -815,31 +852,51 @@ struct FileRow: View {
                 .padding(12)
                 .frame(width: 216)
             }
-            .frame(width: 92)
+            .frame(width: 74)
+
+            // 旋转：逐文件 90° 步进（逆时针 / 顺时针），非 0 时显示当前角度
+            HStack(spacing: 0) {
+                HoverButton(kind: .mini, tip: "逆时针旋转 90°") { rotate(-90) } label: {
+                    Image(systemName: "rotate.left").font(.system(size: 11))
+                        .accessibilityLabel("逆时针旋转 90°")
+                }
+                Text(item.rotation == 0 ? "—" : "\(item.rotation)°")
+                    .font(.system(size: 9.5).monospacedDigit())
+                    .foregroundStyle(item.rotation == 0 ? Color.secondary : Color.accentColor)
+                    .frame(width: 26)
+                    .contentShape(Rectangle())
+                    .onTapGesture { if item.rotation != 0 { rotate(-item.rotation) } }
+                    .help(item.rotation == 0 ? "未旋转" : "点击归零")
+                HoverButton(kind: .mini, tip: "顺时针旋转 90°") { rotate(90) } label: {
+                    Image(systemName: "rotate.right").font(.system(size: 11))
+                        .accessibilityLabel("顺时针旋转 90°")
+                }
+            }
+            .frame(width: 70)
 
             // 份数：步进器（无文本输入）
             HStack(spacing: 1) {
-                HoverButton(kind: .quiet, tip: "减少一份", off: item.copies <= 1) { bump(-1) } label: {
+                HoverButton(kind: .mini, tip: "减少一份", off: item.copies <= 1) { bump(-1) } label: {
                     Image(systemName: "minus").font(.system(size: 9, weight: .semibold))
                 }
                 Text("\(item.copies)")
                     .font(.system(size: 12).monospacedDigit())
-                    .frame(width: 16)
-                HoverButton(kind: .quiet, tip: "增加一份", off: item.copies >= 99) { bump(1) } label: {
+                    .frame(width: 14)
+                HoverButton(kind: .mini, tip: "增加一份", off: item.copies >= 99) { bump(1) } label: {
                     Image(systemName: "plus").font(.system(size: 9, weight: .semibold))
                 }
             }
-            .frame(width: 60)
+            .frame(width: 56)
 
-            StatusBadge(status: item.status).frame(width: 62)
+            StatusBadge(status: item.status).frame(width: 44)
 
-            HoverButton(kind: .quiet, tip: "从队列移除") {
+            HoverButton(kind: .mini, tip: "从队列移除") {
                 withAnimation(motion(reduce)) { model.remove(item) }
             } label: {
                 Image(systemName: "xmark.circle").font(.system(size: 12))
                     .accessibilityLabel("从队列移除 \(item.name)")
             }
-            .frame(width: 32)
+            .frame(width: 22)
         }
         .padding(.horizontal, 14)
         .frame(height: 36)
@@ -862,6 +919,13 @@ struct FileRow: View {
     private func bump(_ d: Int) {
         if let i = model.items.firstIndex(where: { $0.id == item.id }) {
             model.items[i].copies = min(99, max(1, model.items[i].copies + d))
+        }
+    }
+
+    private func rotate(_ d: Int) {
+        guard let i = model.items.firstIndex(where: { $0.id == item.id }) else { return }
+        withAnimation(.easeOut(duration: 0.15)) {
+            model.items[i].rotation = normRotation(model.items[i].rotation + d)
         }
     }
 
@@ -1017,7 +1081,7 @@ struct PreviewPane: View {
     }
     private var pages: Int { item.map { parseRange($0.range, total: $0.pages).count } ?? 0 }
     private var key: String {
-        "\(model.current)-\(model.mode.rawValue)-\(Int(model.percent))-\(page)-\(pages)-\(model.paper.rawValue)-\(model.margin.rawValue)"
+        "\(model.current)-\(model.mode.rawValue)-\(Int(model.percent))-\(page)-\(pages)-\(model.paper.rawValue)-\(model.margin.rawValue)-\(item?.rotation ?? 0)"
     }
 
     var body: some View {
@@ -1050,7 +1114,7 @@ struct PreviewPane: View {
                     VStack(spacing: 10) {
                         Image(systemName: "doc.richtext")
                             .font(.system(size: 26)).foregroundStyle(.tertiary)
-                        Text("添加 PDF 后显示预览")
+                        Text("添加文件后显示预览")
                             .font(.system(size: 12)).foregroundStyle(.secondary)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1083,7 +1147,8 @@ struct PreviewPane: View {
             let want = parseRange(it.range, total: it.pages)
             let src = want.indices.contains(page - 1) ? want[page - 1] : (want.first ?? 1)
             image = renderPage(url: it.url, mode: model.mode, percent: model.percent,
-                               sourcePage: src, paper: model.paper, margin: model.margin)
+                               sourcePage: src, paper: model.paper, margin: model.margin,
+                               rotation: it.rotation)
         }
         .onChange(of: model.current) { _ in page = 1 }
     }
