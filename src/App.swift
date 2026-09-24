@@ -355,6 +355,12 @@ final class Model: ObservableObject {
         let r = listPrinters()
         printers = r.names
         printer = r.def ?? r.names.first ?? ""
+        // 快照 / 演示用：覆盖本机真实打印机名，
+        // 否则截图里会带出「型号 + 序列号」这种个人设备信息。
+        if let fake = ProcessInfo.processInfo.environment["BATCHPRINT_PRINTER"] {
+            printers = [fake]
+            printer = fake
+        }
     }
 
     var totalSheets: Int {
@@ -1614,7 +1620,7 @@ func dumpNSViews(_ v: NSView, _ d: Int) {
 func snapshotIfRequested() {
     let env = ProcessInfo.processInfo.environment
     guard let out = env["BATCHPRINT_SNAPSHOT"] else { return }
-    let delay = Double(ProcessInfo.processInfo.environment["BATCHPRINT_SNAPSHOT_DELAY"] ?? "") ?? 2.2
+    let delay = Double(ProcessInfo.processInfo.environment["BATCHPRINT_SNAPSHOT_DELAY"] ?? "") ?? 3.0
     DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
         guard let win = NSApp.windows.first(where: { $0.isVisible && $0.contentView != nil }),
               let v = win.contentView else {
