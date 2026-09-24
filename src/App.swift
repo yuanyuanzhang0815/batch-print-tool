@@ -478,6 +478,14 @@ func motion(_ reduce: Bool) -> Animation? {
     reduce ? .easeOut(duration: 0.18) : .spring(response: 0.34, dampingFraction: 0.82)
 }
 
+// ── 动效 token（animate skill）────────────────────────
+// 内置 easeOut 太弱，UI 上要用 cubic-bezier 的强曲线；
+// 弹簧只留给「跟手、可中断」的操作，不要拿它当默认。
+enum Motion {
+    /// cubic-bezier(0.23, 1, 0.32, 1) —— 强 ease-out：进场、状态落定
+    static let out = Animation.timingCurve(0.23, 1, 0.32, 1, duration: 0.20)
+}
+
 func scaleLabel(_ m: Model) -> String {
     switch m.mode {
     case .custom: return "缩放 \(Int(m.percent))%"
@@ -615,6 +623,22 @@ func paneTitle(_ t: String) -> some View {
     Text(t).font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
 }
 
+// ── 队列行的宽度预算 ───────────────────────────────────
+/// 文件名列 = 队列栏内容宽 − 右侧合计，**硬算**，不靠 HStack 协商。
+/// 之前用 `maxWidth: .infinity` + `fixedSize(vertical:)` 让 Text 自己决定宽度，
+/// 结果文本会溢出自己的列压到「范围」pill 下面。硬约束 + clipped 才治得住。
+enum RowMetrics {
+    static let hPad: CGFloat = 14          // 行左右内边距
+    static let rangeSlot: CGFloat = 50     // 范围槽（比内容宽，留出与文件名的呼吸间距）
+    static let copiesSlot: CGFloat = 62    // 份数槽
+    static let utilSlot: CGFloat = 62      // 行尾效用位
+    static var right: CGFloat { rangeSlot + copiesSlot + utilSlot }
+
+    static func nameWidth(paneWidth: CGFloat) -> CGFloat {
+        max(96, paneWidth - hPad * 2 - right)
+    }
+}
+
 // ── 主界面：文件队列 34% ｜ 打印设置 23% ｜ 预览 43% ─────
 struct ContentView: View {
     var sampleDir: String? = nil
@@ -625,9 +649,11 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 0) {
             GeometryReader { geo in
+                let paneW = max(340, geo.size.width * 0.34)
                 HStack(spacing: 0) {
-                    FileTable(model: model, reduce: reduce, targeted: targeted)
-                        .frame(width: max(340, geo.size.width * 0.34))
+                    FileTable(model: model, reduce: reduce, targeted: targeted,
+                              nameWidth: RowMetrics.nameWidth(paneWidth: paneW))
+                        .frame(width: paneW)
                     Hairline()
                     SettingsPanel(model: model)
                         .frame(width: max(272, geo.size.width * 0.23))
@@ -677,6 +703,7 @@ struct ContentView: View {
             if ProcessInfo.processInfo.environment["BATCHPRINT_DEMO"] == "rotate", !model.items.isEmpty {
                 model.items[0].rotation = 90
                 if model.items.count > 1 { model.items[1].rotation = 270 }
+                model.current = 0   // 让预览头部的「已转 90° · 复位」也能被快照盖到
             }
         }
     }
@@ -687,6 +714,7 @@ struct FileTable: View {
     @ObservedObject var model: Model
     let reduce: Bool
     var targeted = false
+    let nameWidth: CGFloat
 
     var body: some View {
         VStack(spacing: 0) {
@@ -710,50 +738,63 @@ struct FileTable: View {
             .frame(height: 42)
 
             if model.items.isEmpty {
-                empty
+                empty.transition(.opacity)
             } else {
-                columns
-                Rectangle().fill(Color.primary.opacity(0.06)).frame(height: 1)
-                ScrollView {
-                    VStack(spacing: 0) {
-                        ForEach(Array(model.items.enumerated()), id: \.element.id) { idx, item in
-                            FileRow(model: model, item: item, index: idx, reduce: reduce)
+                VStack(spacing: 0) {
+                    columns
+                    Rectangle().fill(Color.primary.opacity(0.06)).frame(height: 1)
+                    ScrollView {
+                        VStack(spacing: 0) {
+                            ForEach(Array(model.items.enumerated()), id: \.element.id) { idx, item in
+                                FileRow(model: model, item: item, index: idx, reduce: reduce, nameWidth: nameWidth)
+                            }
                         }
                     }
+                    .scrollContentBackground(.hidden)
+                    .background(Color.clear)
                 }
-                .scrollContentBackground(.hidden)
-                .background(Color.clear)
+                .transition(.opacity)
             }
         }
+        // 空态 ↔ 队列的交接用 200ms 强 ease-out，不然第一份文件是硬跳出来的
+        .animation(reduce ? .easeOut(duration: 0.16) : Motion.out, value: model.items.isEmpty)
         .background(Color.clear)
         .onDeleteCommand { withAnimation(motion(reduce)) { model.removeSelected() } }
     }
 
+    // 列宽是硬约束：队列栏 421pt，右侧每 1pt 都是从文件名嘴里抢出来的。
+    // 旧的 页数(44) / 旋转(70) / 状态(44) / 删除(22) 四列合计 180pt 全部回收给文件名。
     private var columns: some View {
         HStack(spacing: 0) {
-            Text("文件名").frame(maxWidth: .infinity, alignment: .leading)
-            Text("页数").frame(width: 32, alignment: .center)
-            Text("页码范围").frame(width: 74, alignment: .center)
-            Text("旋转").frame(width: 70, alignment: .center)
-            Text("份数").frame(width: 56, alignment: .center)
-            Text("状态").frame(width: 44, alignment: .center)
-            Text("").frame(width: 22)
+            Text("文件").frame(width: nameWidth, alignment: .leading)
+            Text("范围").padding(.trailing, 8).frame(width: RowMetrics.rangeSlot, alignment: .trailing)
+            Text("份数").padding(.trailing, 8).frame(width: RowMetrics.copiesSlot, alignment: .trailing)
+            Text("").frame(width: RowMetrics.utilSlot)
         }
         .font(.system(size: 11, weight: .medium))
         .foregroundStyle(.secondary)
-        .padding(.horizontal, 14)
+        .padding(.horizontal, RowMetrics.hPad)
         .frame(height: 28)
     }
 
+    // 空状态：不只是拖拽提示，也给一个居中的大按钮（和顶部 tab 同样的入口，但看得见）
     private var empty: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 12) {
             Image(systemName: "tray.and.arrow.down")
-                .font(.system(size: 28))
+                .font(.system(size: 34))
                 .foregroundStyle(.tertiary)
             Text(targeted ? "松手即可加入队列" : "将文件或文件夹拖到这里")
                 .font(.system(size: 13))
                 .foregroundStyle(targeted ? Color.accentColor : Color.primary)
-            Text("PDF · 图片 · Word/Excel/PPT，支持批量").font(.system(size: 11)).foregroundStyle(.tertiary)
+            Text("PDF · 图片 · Word/Excel/PPT，支持批量")
+                .font(.system(size: 11))
+                .foregroundStyle(.tertiary)
+
+            // 一个按钮就够：同一个面板里文件和文件夹都能选（选文件夹就把它里面的文件全加进来）
+            HoverButton(kind: .cta, tip: "选择文件或文件夹（⌘O，可多选）") { addViaPanel() } label: {
+                Label("添加文件", systemImage: "plus")
+            }
+            .padding(.top, 4)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -761,6 +802,8 @@ struct FileTable: View {
     private func addViaPanel() {
         let p = NSOpenPanel()
         p.allowsMultipleSelection = true
+        // 文件和文件夹都能选：不需要记得「想加一整个文件夹得按另一个按钮」
+        p.canChooseFiles = true
         p.canChooseDirectories = true
         var types: [UTType] = [.pdf, .image]
         for e in OFFICE_EXTS { if let t = UTType(filenameExtension: e) { types.append(t) } }
@@ -778,33 +821,63 @@ struct FileRow: View {
     let item: PrintItem
     let index: Int
     let reduce: Bool
+    let nameWidth: CGFloat
     @State private var hover = false
     @State private var showRange = false
 
+    // hoverPreview 是项目的快照 QA 钩子（BATCHPRINT_HOVER）：让「hover 才出现的东西」
+    // 能被真实渲染出来验证。BATCHPRINT_HOVER_ROW=<idx> 只点亮某一行——否则快照里
+    // 所有行的 × 都同时出现，看着像 bug，其实只是钩子的产物（真实行为是逐行 onHover）。
+    @Environment(\.hoverPreview) private var hoverPreview
+    private static let forcedHoverRow: Int? =
+        ProcessInfo.processInfo.environment["BATCHPRINT_HOVER_ROW"].flatMap(Int.init)
+
     private var isSelected: Bool { model.current == index }
     private var badRange: Bool { !isValidRange(item.range, total: item.pages) }
+    private var isDefaultRange: Bool { item.range.trimmingCharacters(in: .whitespaces) == "全部" }
+    private var hl: Bool { hover || hoverPreview || Self.forcedHoverRow == index }
+
+    // 范围 pill 的四个风格分量单独拆出来：写在 view 里编译器会 type-check 超时。
+    private var rangeTextColor: Color {
+        if badRange { return .red }
+        return isDefaultRange ? .secondary : .accentColor
+    }
+    private var rangeFill: Color {
+        guard isDefaultRange else { return Color.accentColor.opacity(0.10) }
+        return Color.primary.opacity(hl ? 0.07 : 0)
+    }
+    private var rangeBorder: Color {
+        if badRange { return Color.red.opacity(0.75) }
+        guard isDefaultRange else { return Color.accentColor.opacity(0.35) }
+        return Color.primary.opacity(hl ? 0.16 : 0.08)
+    }
 
     var body: some View {
         HStack(spacing: 0) {
-            HStack(spacing: 6) {
+            // 文件名：折两行显示，不截断。列宽靠右侧固定列自然得出，
+            // 只有**文本**自己 clipped（绝不能裁整个 cell：那会把文件类型图标一起挤没，
+            // 实测 photo 符号会整片消失）。
+            HStack(alignment: .top, spacing: 7) {
                 Image(systemName: item.isImage ? "photo" : (item.isOffice ? "doc.text" : "doc.richtext"))
+                    // 文件类型只用**形状**区分，不用颜色：蓝色在本 app 里只有一个含义
+                    // ——「这一行的打印设置偏离了默认」。icon 也上蓝的话，
+                    // 用户扫列表时就不再能靠「突然蓝一下」发现异常。
+                    .foregroundStyle(.secondary)
                     .font(.system(size: 12))
-                    .foregroundStyle(item.isImage
-                        ? Color(red: 0.16, green: 0.48, blue: 0.88)
-                        : (item.isOffice ? Color(red: 0.13, green: 0.55, blue: 0.32)
-                                         : Color(red: 0.84, green: 0.27, blue: 0.22)))
-                Text(item.name)
+                    .fixedSize()
+                    .frame(width: 13, alignment: .center)
+                    .padding(.top, 2)
+                nameText
                     .font(.system(size: 12))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                    .lineSpacing(1.5)
+                    .lineLimit(2)
+                    .truncationMode(.tail)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .clipped()
                     .help(item.name)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-
-            Text("\(item.pages)")
-                .font(.system(size: 12).monospacedDigit())
-                .foregroundStyle(.secondary)
-                .frame(width: 44)
 
             // 页码范围：主窗口内不放文本输入框（避免 field editor 把 I-beam 卡到整窗），
             // 改成按钮 + popover 编辑
@@ -814,13 +887,14 @@ struct FileRow: View {
                 Text(item.range)
                     .font(.system(size: 12))
                     .lineLimit(1)
-                    .frame(width: 54)
+                    .foregroundStyle(rangeTextColor)
                     .padding(.vertical, 3)
-                    .background(RoundedRectangle(cornerRadius: 5)
-                        .fill(Color.primary.opacity(hover ? 0.07 : 0.0)))
+                    .padding(.horizontal, 6)
+                    // 默认（全部）安静：无填充 + 极淡描边；hover 才抬起；
+                    // 偏离默认（1–2）走蓝。再次贯彻「默认安静、偏离才讲话」。
+                    .background(RoundedRectangle(cornerRadius: 5).fill(rangeFill))
                     .overlay(RoundedRectangle(cornerRadius: 5)
-                        .strokeBorder(badRange ? Color.red.opacity(0.75) : Color.primary.opacity(0.12),
-                                      lineWidth: badRange ? 1.6 : 1))
+                        .strokeBorder(rangeBorder, lineWidth: badRange ? 1.6 : 1))
             }
             .buttonStyle(.plain)
             .help(badRange ? "页码范围无效（共 \(item.pages) 页），将按全部页打印" : "点击设置页码范围")
@@ -852,66 +926,111 @@ struct FileRow: View {
                 .padding(12)
                 .frame(width: 216)
             }
-            .frame(width: 74)
+            .padding(.trailing, 8)
+            .frame(width: RowMetrics.rangeSlot, alignment: .trailing)
 
-            // 旋转：逐文件 90° 步进（逆时针 / 顺时针），非 0 时显示当前角度
+            // 份数：保持 v1.2 的「直接可点」步进器，只是收窄到 56pt，值偏离 1 才变蓝
             HStack(spacing: 0) {
-                HoverButton(kind: .mini, tip: "逆时针旋转 90°") { rotate(-90) } label: {
-                    Image(systemName: "rotate.left").font(.system(size: 11))
-                        .accessibilityLabel("逆时针旋转 90°")
-                }
-                Text(item.rotation == 0 ? "—" : "\(item.rotation)°")
-                    .font(.system(size: 9.5).monospacedDigit())
+                RailButton(sys: "minus", tip: "减少一份", off: item.copies <= 1) { bump(-1) }
+                Text("\(item.copies)×")
+                    .font(.system(size: 11.5).monospacedDigit())
+                    .foregroundStyle(item.copies > 1 ? Color.accentColor : Color.secondary)
+                    .frame(width: 20)
+                RailButton(sys: "plus", tip: "增加一份", off: item.copies >= 99) { bump(1) }
+            }
+            .padding(.trailing, 6)
+            .frame(width: RowMetrics.copiesSlot, alignment: .trailing)
+
+            // 行尾效用位（固定宽度、左对齐）：
+            // 旋转就是**一个按钮**：点一下 +90°，0→90→180→270→0 循环，可以一直点。
+            // 未旋转时是一个安静的 ↻，转过之后变成蓝色的「↻90°」——
+            // 状态和入口是同一个东西，既不用 hover 才出来，也不抽动布局。
+            // （逆时针 ↺ 放在行右键菜单和预览头部：那两处有地方写标签。）
+            HStack(spacing: 4) {
+                if item.status != .ready {
+                    StatusBadge(status: item.status)
+                } else {
+                    Button {
+                        // ⌥ 点击 = 逆时针 90°。任何宽度成本都不花，却把「反悔」
+                        // （270° 想回 90°）从两下变一下；不写进 UI，只写在 tooltip 里。
+                        let ccw = NSEvent.modifierFlags.contains(.option)
+                        rotate(ccw ? -90 : 90)
+                    } label: {
+                        Group {
+                            if item.rotation == 0 {
+                                Image(systemName: "arrow.clockwise")
+                                    .font(.system(size: 11))
+                            } else {
+                                Text("↻\(item.rotation)°")
+                                    .font(.system(size: 10.5, weight: .medium).monospacedDigit())
+                                    .contentTransition(.numericText())
+                            }
+                        }
+                        .frame(minWidth: 20, minHeight: 22)
+                    }
+                    .buttonStyle(.plain)
                     .foregroundStyle(item.rotation == 0 ? Color.secondary : Color.accentColor)
-                    .frame(width: 26)
+                    .opacity(item.rotation == 0 && !hl ? 0.6 : 1)
                     .contentShape(Rectangle())
-                    .onTapGesture { if item.rotation != 0 { rotate(-item.rotation) } }
-                    .help(item.rotation == 0 ? "未旋转" : "点击归零")
-                HoverButton(kind: .mini, tip: "顺时针旋转 90°") { rotate(90) } label: {
-                    Image(systemName: "rotate.right").font(.system(size: 11))
-                        .accessibilityLabel("顺时针旋转 90°")
+                    .animation(Motion.out, value: item.rotation)
+                    .help(item.rotation == 0
+                          ? "点击顺时针旋转 90°（⌥ 点击逆时针）"
+                          : "当前 \(item.rotation)°，点击继续顺时针 90°（⌥ 点击逆时针）")
+                    if hl {
+                        RailButton(sys: "xmark.circle", tip: "从队列移除") {
+                            withAnimation(motion(reduce)) { model.remove(item) }
+                        }
+                        .transition(.opacity)
+                    }
                 }
             }
-            .frame(width: 70)
-
-            // 份数：步进器（无文本输入）
-            HStack(spacing: 1) {
-                HoverButton(kind: .mini, tip: "减少一份", off: item.copies <= 1) { bump(-1) } label: {
-                    Image(systemName: "minus").font(.system(size: 9, weight: .semibold))
-                }
-                Text("\(item.copies)")
-                    .font(.system(size: 12).monospacedDigit())
-                    .frame(width: 14)
-                HoverButton(kind: .mini, tip: "增加一份", off: item.copies >= 99) { bump(1) } label: {
-                    Image(systemName: "plus").font(.system(size: 9, weight: .semibold))
-                }
-            }
-            .frame(width: 56)
-
-            StatusBadge(status: item.status).frame(width: 44)
-
-            HoverButton(kind: .mini, tip: "从队列移除") {
-                withAnimation(motion(reduce)) { model.remove(item) }
-            } label: {
-                Image(systemName: "xmark.circle").font(.system(size: 12))
-                    .accessibilityLabel("从队列移除 \(item.name)")
-            }
-            .frame(width: 22)
+            .frame(width: RowMetrics.utilSlot, alignment: .leading)
+            // ⊗ 淡入而不是硬弹出（hover 类变化：快、微）
+            .animation(.easeOut(duration: 0.12), value: hl)
+            // 效用位左对齐：让淡 ↻ / 箭头 / ⊗ 始终贴着份数那一列，
+            // 不然孔位太宽时会变成一片空白。右端固定宽度保证状态切换不抽动布局。
+            .frame(width: 62, alignment: .leading)
         }
         .padding(.horizontal, 14)
-        .frame(height: 36)
+        .frame(minHeight: 44)
         .background(background)
+        // 不占宽度的熟手路径：旋转 / 页码范围 / 移除都有稳定入口，
+        // 不必依赖「记得这里能 hover」。
+        .contextMenu {
+            Button("左转 90°") { rotate(-90) }
+            Button("右转 90°") { rotate(90) }
+            if item.rotation != 0 {
+                Button("复位方向") { rotate(-item.rotation) }
+            }
+            Divider()
+            Button("设置页码范围…") { showRange = true }
+            Button("在访达中显示") { NSWorkspace.shared.activateFileViewerSelecting([item.url]) }
+            Divider()
+            Button("从队列移除") { withAnimation(motion(reduce)) { model.remove(item) } }
+        }
         .contentShape(Rectangle())
         .onHover { h in withAnimation(.easeOut(duration: 0.12)) { hover = h } }
         .onTapGesture { model.current = index }
-        .transition(.asymmetric(
-            insertion: .opacity.combined(with: .scale(scale: 0.98, anchor: .top)),
-            removal: .opacity.combined(with: .scale(scale: 0.98, anchor: .top))))
+        // 选中/悬停底色用 120ms 的颜色过渡（tens/day 的操作：要快到几乎察觉不到）
+        .animation(reduce ? nil : .easeOut(duration: 0.12), value: isSelected)
+        // 进场/退场对称，起点 scale 0.97（不是 0，也不是 0.98 那种看不出来的）
+        // 进场/退场只用 opacity：列表行整体 scale 会让密集表格的竖向基准一起「呼吸」，
+        // 行的出现/消失本身就是布局位移，不需要额外的形状动画。
+        .transition(.opacity)
+    }
+
+    /// 文件名 + 页数尾缀（灰，>1 页才有）。
+    /// 旋转角度不放这里：名字占满两行时尾缀会被截掉，状态就看不见了。
+    /// 用字符串插值而不是 `Text + Text`：后者在 macOS 26 已弃用。
+    private var nameText: Text {
+        item.pages > 1
+            ? Text("\(Text(item.name))\(Text("  \(item.pages) 页").font(.system(size: 10.5)).foregroundStyle(Color.secondary))")
+            : Text(item.name)
     }
 
     private var background: Color {
         if isSelected { return Color.accentColor.opacity(scheme == .dark ? 0.24 : 0.13) }
-        return hover ? Color.primary.opacity(scheme == .dark ? 0.11 : 0.06) : Color.clear
+        return hl ? Color.primary.opacity(scheme == .dark ? 0.11 : 0.06) : Color.clear
     }
 
     @Environment(\.colorScheme) private var scheme
@@ -922,8 +1041,11 @@ struct FileRow: View {
         }
     }
 
+    // 只有「结果只能在预览里看到」的操作才抢焦点：旋转完预览不跳过去，用户看不到转动效果。
+    // 范围/份数的结果就在行内看得见，所以不抢焦点。
     private func rotate(_ d: Int) {
         guard let i = model.items.firstIndex(where: { $0.id == item.id }) else { return }
+        model.current = i
         withAnimation(.easeOut(duration: 0.15)) {
             model.items[i].rotation = normRotation(model.items[i].rotation + d)
         }
@@ -933,6 +1055,39 @@ struct FileRow: View {
         Binding(get: { item.range }, set: { v in
             if let i = model.items.firstIndex(where: { $0.id == item.id }) { model.items[i].range = v }
         })
+    }
+}
+
+// ── 行尾密集控制区专用按钮 ─────────────────────────────
+/// 比 HoverButton(.mini) 还小一号（18pt 宽）。
+/// 队列栏 421pt 是硬约束，右侧每 1pt 都要从文件名嘴里抢：
+/// 三个控件用 .mini 会吃掉 74pt，换成 18pt 后只吃 62pt。
+struct RailButton: View {
+    let sys: String
+    let tip: String
+    var off = false
+    let action: () -> Void
+    @State private var hover = false
+
+    init(sys: String, tip: String, off: Bool = false, action: @escaping () -> Void) {
+        self.sys = sys; self.tip = tip; self.off = off; self.action = action
+    }
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: sys)
+                .font(.system(size: 11))
+                .frame(width: 18, height: 22)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(hover ? Color.primary : Color.secondary)
+        .background(RoundedRectangle(cornerRadius: 5)
+            .fill(Color.primary.opacity(hover ? 0.10 : 0)))
+        .opacity(off ? 0.35 : 1)
+        .disabled(off)
+        .onHover { h in withAnimation(.easeOut(duration: 0.10)) { hover = h } }
+        .help(tip)
     }
 }
 
@@ -1084,12 +1239,48 @@ struct PreviewPane: View {
         "\(model.current)-\(model.mode.rawValue)-\(Int(model.percent))-\(page)-\(pages)-\(model.paper.rawValue)-\(model.margin.rawValue)-\(item?.rotation ?? 0)"
     }
 
+    /// 旋转主入口作用在当前选中文件上，和行内按钮、右键菜单共用同一套归一化。
+    private func rotateCurrent(_ d: Int) {
+        guard model.items.indices.contains(model.current) else { return }
+        withAnimation(.easeOut(duration: 0.15)) {
+            model.items[model.current].rotation = normRotation(model.items[model.current].rotation + d)
+        }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
+            HStack(spacing: 10) {
                 paneTitle("预览")
                 Spacer()
+                // 旋转主入口：作用在当前选中文件上。方向问题是用户在预览里
+                // 发现「倒了」的，入口就该在手边，不靠 hover 也不靠记忆。
                 if item != nil {
+                    // 三个按钮固定占位，**没有「出现/消失」**：
+                    // 复位以前是一个会冒出来的「↻90° · 复位」文字按钮，
+                    // 结果每转一次就把旁边的 ↺ ↻ 推走一段，而鼠标正停在按钮上 ——
+                    // 实测会来回来去变换位置、点错。
+                    // 现在复位是第三个图标按钮，未旋转时禁用发淡，位置永远不变。
+                    // 当前角度不再在这里重复（行尾已经写着 `↻90°`）。
+                    HStack(spacing: 1) {
+                        HoverButton(kind: .glyph, tip: "逆时针旋转 90°") { rotateCurrent(-90) } label: {
+                            Image(systemName: "arrow.counterclockwise").font(.system(size: 12))
+                                .accessibilityLabel("逆时针旋转 90°")
+                        }
+                        HoverButton(kind: .glyph, tip: "顺时针旋转 90°") { rotateCurrent(90) } label: {
+                            Image(systemName: "arrow.clockwise").font(.system(size: 12))
+                                .accessibilityLabel("顺时针旋转 90°")
+                        }
+                        HoverButton(kind: .glyph,
+                                    tip: (item?.rotation ?? 0) == 0
+                                        ? "未旋转（无需复位）"
+                                        : "复位方向（当前 \(item?.rotation ?? 0)°）",
+                                    off: (item?.rotation ?? 0) == 0) {
+                            rotateCurrent(-(item?.rotation ?? 0))
+                        } label: {
+                            Image(systemName: "arrow.uturn.backward").font(.system(size: 12))
+                                .accessibilityLabel("复位方向")
+                        }
+                    }
                     Text("\(model.paper.rawValue) · \(scaleLabel(model))")
                         .font(.system(size: 11)).foregroundStyle(.tertiary)
                 }
@@ -1146,11 +1337,15 @@ struct PreviewPane: View {
             try? await Task.sleep(nanoseconds: 60_000_000)
             let want = parseRange(it.range, total: it.pages)
             let src = want.indices.contains(page - 1) ? want[page - 1] : (want.first ?? 1)
-            image = renderPage(url: it.url, mode: model.mode, percent: model.percent,
-                               sourcePage: src, paper: model.paper, margin: model.margin,
-                               rotation: it.rotation)
+            let next = renderPage(url: it.url, mode: model.mode, percent: model.percent,
+                                  sourcePage: src, paper: model.paper, margin: model.margin,
+                                  rotation: it.rotation)
+            // 不做「转过去」的动画：旋转是精确几何变换，内容自己换了朝向已经说明了一切，
+            // 再叠一个 90° 旋转既生硬又多余（旋转本身是 tens/day 的操作，应近乎无感）。
+            // 图本身还是带 opacity 交叉淡入的（.animation(.easeOut, value: key)）。
+            image = next
         }
-        .onChange(of: model.current) { _ in page = 1 }
+        .onChange(of: model.current) { _, _ in page = 1 }
     }
 }
 

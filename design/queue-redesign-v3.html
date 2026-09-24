@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>文件队列宽度重分配 v3（纯通用，无解析）</title>
+<style>
+  :root{
+    --pane: 421px;
+    --pad: 14px;
+    --bg: #ECECEE;
+    --sel: #E1E1E5;
+    --txt: #1D1D1F;
+    --txt2: #6E6E73;
+    --txt3: #9A9AA0;
+    --pdf: #D64539;
+    --img: #2979E0;
+    --office: #218C52;
+    --accent: #0A84FF;
+    --range-w: 58px;
+    --copies-w: 38px;
+    --util-w: 58px;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:#F5F5F7;font-family:-apple-system,"SF Pro Text","Helvetica Neue",sans-serif;-webkit-font-smoothing:antialiased}
+  .stage{padding:26px 30px 44px}
+  h1{font-size:15px;font-weight:600;color:#1D1D1F;margin:0 0 4px}
+  .sub{font-size:11.5px;color:#6E6E73;margin:0 0 22px}
+  .label{font-size:10.5px;font-weight:600;color:#9A9AA0;letter-spacing:.06em;margin:0 0 8px}
+  .compare{display:flex;gap:24px;align-items:flex-start;flex-wrap:wrap;margin-bottom:28px}
+  .pane{width:var(--pane);border-radius:10px;overflow:hidden;background:var(--bg);
+        box-shadow:0 1px 2px rgba(0,0,0,.10),0 8px 22px rgba(0,0,0,.07)}
+  .head{height:42px;display:flex;align-items:center;gap:8px;padding:0 10px}
+  .head .t{font-size:11.5px;font-weight:500;color:var(--txt2)}
+  .head .sp{flex:1}
+  .chip{height:22px;border-radius:6px;display:flex;align-items:center;gap:4px;padding:0 9px;
+        font-size:11.5px;color:var(--txt);background:rgba(0,0,0,.055)}
+  .chip.pri{background:#fff;box-shadow:0 0 0 .5px rgba(0,0,0,.10),0 1px 1.5px rgba(0,0,0,.07)}
+  .cols{height:28px;display:flex;align-items:center;padding:0 var(--pad);
+        font-size:11px;font-weight:500;color:var(--txt2)}
+  .rule{height:1px;background:rgba(0,0,0,.06)}
+  .cell{text-align:center}
+  .c-32{width:32px}.c-44{width:44px}.c-74{width:74px}.c-70{width:70px}.c-56{width:56px}.c-22{width:22px}
+  .pill{font-size:11px;border-radius:5px;padding:2px 9px;background:rgba(0,0,0,.06);color:var(--txt2)}
+
+  /* 现状 */
+  .row{height:36px;display:flex;align-items:center;padding:0 var(--pad)}
+  .row.sel{background:var(--sel)}
+  .name36{flex:1;min-width:0;display:flex;align-items:center;gap:6px;font-size:12px}
+  .name36 span{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+  .now-w{width:44px;flex:none;text-align:center;font-size:12px;color:var(--txt2)}
+
+  /* A：单行加宽 */
+  .rowA{height:38px;display:flex;align-items:center;padding:0 var(--pad);
+        border-bottom:.5px solid rgba(0,0,0,.035)}
+  .rowA:last-child{border-bottom:none}
+  .rowA.sel{background:var(--sel)}
+  .nameA{flex:1;min-width:0;display:flex;align-items:center;gap:7px;font-size:12px;color:var(--txt)}
+  .nameA span{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+  .val{flex:none;text-align:right;font-size:11.5px;color:var(--txt2);
+       font-variant-numeric:tabular-nums;padding-right:11px;white-space:nowrap}
+  .val.mod{color:var(--accent);font-weight:500}
+  .rng{width:var(--range-w)}.copies{width:var(--copies-w)}
+  .util{width:var(--util-w);flex:none;display:flex;align-items:center;justify-content:flex-end;gap:8px;
+        font-size:12px;color:#6E6E73}
+  .util .g{opacity:0;transition:opacity .12s;width:12px;text-align:center;font-style:normal}
+  .util .g.on{opacity:.5}
+  .rowA:hover .util .g,.rowB:hover .util .g,.rowC:hover .util .g{opacity:1}
+  .util .rot{font-size:10.5px;font-weight:500;color:var(--accent);opacity:1;white-space:nowrap;
+             letter-spacing:-.02em}
+
+  /* 旋转演示 */
+  .rotwrap{display:flex;gap:24px;flex-wrap:wrap;align-items:flex-start;margin-bottom:8px}
+  .mini{width:var(--pane);border-radius:10px;overflow:hidden;background:var(--bg);
+        box-shadow:0 1px 2px rgba(0,0,0,.10),0 8px 22px rgba(0,0,0,.07)}
+  .rowC{height:44px;display:flex;align-items:center;padding:0 var(--pad);
+        border-bottom:.5px solid rgba(0,0,0,.035);background:rgba(0,0,0,.045)}
+  .rowC.plain{background:transparent}
+  .cap{font-size:11px;color:var(--txt2);margin:8px 0 18px;max-width:421px}
+
+  .prevhead{width:521px;border-radius:10px;background:#fff;
+            box-shadow:0 1px 2px rgba(0,0,0,.08),0 6px 16px rgba(0,0,0,.05);overflow:hidden}
+  .ph-top{height:38px;display:flex;align-items:center;gap:10px;padding:0 14px;
+          font-size:11.5px;color:var(--txt2);border-bottom:.5px solid rgba(0,0,0,.06)}
+  .ph-top .sp{flex:1}
+  .ph-acts{height:38px;display:flex;align-items:center;gap:6px;padding:0 10px;background:rgba(0,0,0,.018)}
+  .tbtn{height:24px;border-radius:6px;display:flex;align-items:center;gap:5px;padding:0 9px;
+        font-size:11.5px;color:var(--txt);background:rgba(0,0,0,.05)}
+  .tbtn.on{background:rgba(10,132,255,.12);color:#0A6BD0;font-weight:500}
+  .ph-body{height:104px;display:flex;align-items:center;justify-content:center;
+           font-size:11px;color:var(--txt3);background:#FAFAFA}
+  .spacer{flex:1}
+  .ico{width:13px;flex:none;text-align:center;font-size:12px}
+  .ico.pdf{color:var(--pdf)}.ico.img{color:var(--img)}.ico.office{color:var(--office)}
+
+  /* B：文件名两行，永不截断 */
+  .rowB{min-height:44px;display:flex;align-items:center;padding:4px var(--pad) 4px var(--pad);
+        border-bottom:.5px solid rgba(0,0,0,.035)}
+  .rowB:last-child{border-bottom:none}
+  .rowB.sel{background:var(--sel)}
+  .nameB{flex:1;min-width:0;display:flex;gap:7px;font-size:12px;color:var(--txt)}
+  .nameB .t{min-width:0}
+  .nameB .l{
+    display:block;line-height:15.5px;
+    overflow:hidden;
+    display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;
+    word-break:break-all;
+  }
+  .pages{font-size:10.5px;color:var(--txt3);font-variant-numeric:tabular-nums}
+
+  .notes{max-width:1180px;font-size:12px;color:#3A3A3C;line-height:1.7}
+  .notes b{color:#1D1D1F}
+  .notes code{background:rgba(0,0,0,.055);padding:1px 4px;border-radius:3px;font-size:11px}
+  .tag{display:inline-block;font-size:10px;font-weight:600;padding:1px 6px;border-radius:4px;
+       background:rgba(0,0,0,.06);color:#6E6E73;margin-right:6px}
+  .cols2{display:flex;gap:34px;flex-wrap:wrap}
+  .col{max-width:520px}
+  ul{margin:6px 0 14px;padding-left:18px}
+</style>
+</head>
+<body>
+<div class="stage">
+
+  <h1>文件队列宽度重分配 v3 · 纯通用</h1>
+  <p class="sub">真实宽度 1:1（队列栏 421pt）。不做任何文件名解析、不做金额列、不做类别分类。只做两件事：把固定列占掉的宽度还给文件名；让文件名折两行而不是被截断。</p>
+
+  <div class="compare">
+
+    <!-- 现状 -->
+    <div>
+      <p class="label">现状 · 36pt · 固定列 338pt · 名字剩 43–80pt</p>
+      <div class="pane">
+        <div class="head"><span class="t">文件队列</span><span class="sp"></span>
+          <span class="chip">清空</span><span class="chip pri">＋ 添加文件</span></div>
+        <div class="cols">
+          <div style="flex:1">文件名</div>
+          <div class="c-32 cell">页数</div><div class="c-74 cell">页码范围</div>
+          <div class="c-70 cell">旋转</div><div class="c-56 cell">份数</div><div class="c-44 cell">状态</div><div class="c-22"></div>
+        </div>
+        <div class="rule"></div>
+        <div class="row sel"><div class="name36"><span class="ico pdf">▤</span><span>72.90元-电子发票-中国…</span></div>
+          <div class="now-w">1</div><div class="c-74" style="display:flex;justify-content:center"><span class="pill">全部</span></div>
+          <div class="c-70 cell" style="color:var(--txt3)">—</div><div class="c-56 cell">1</div>
+          <div class="c-44 cell" style="color:var(--txt2)">就绪</div><div class="c-22 cell" style="color:var(--txt3)">⊗</div></div>
+        <div class="row"><div class="name36"><span class="ico img">▣</span><span>72.90元-付款记录-…</span></div>
+          <div class="now-w">1</div><div class="c-74" style="display:flex;justify-content:center"><span class="pill">全部</span></div>
+          <div class="c-70 cell" style="color:var(--txt3)">—</div><div class="c-56 cell">1</div>
+          <div class="c-44 cell" style="color:var(--txt2)">就绪</div><div class="c-22 cell" style="color:var(--txt3)">⊗</div></div>
+        <div class="row"><div class="name36"><span class="ico pdf">▤</span><span>1148元-电子发票-上…</span></div>
+          <div class="now-w">1</div><div class="c-74" style="display:flex;justify-content:center"><span class="pill">全部</span></div>
+          <div class="c-70 cell" style="color:var(--txt3)">—</div><div class="c-56 cell">1</div>
+          <div class="c-44 cell" style="color:var(--txt2)">就绪</div><div class="c-22 cell" style="color:var(--txt3)">⊗</div></div>
+        <div class="row"><div class="name36"><span class="ico img">▣</span><span>scan001.png</span></div>
+          <div class="now-w">1</div><div class="c-74" style="display:flex;justify-content:center"><span class="pill">全部</span></div>
+          <div class="c-70 cell" style="color:var(--txt3)">—</div><div class="c-56 cell">1</div>
+          <div class="c-44 cell" style="color:var(--txt2)">就绪</div><div class="c-22 cell" style="color:var(--txt3)">⊗</div></div>
+      </div>
+    </div>
+
+    <!-- A -->
+    <div>
+      <p class="label">方案 A · 38pt 单行 · 名字 261pt（仍会截断最长名）</p>
+      <div class="pane">
+        <div class="head"><span class="t">文件队列</span><span class="sp"></span>
+          <span class="chip">清空</span><span class="chip pri">＋ 添加文件</span></div>
+        <div class="cols">
+          <div style="flex:1">文件名</div>
+          <div class="val rng">范围</div><div class="val copies">份数</div><div style="width:var(--util-w)"></div>
+        </div>
+        <div class="rule"></div>
+        <div class="rowA sel"><div class="nameA"><span class="ico pdf">▤</span><span>72.90元-电子发票-中国铁路上海局集团有限公司-20260915.pdf</span></div>
+          <div class="val rng">全部</div><div class="val copies">1×</div><div class="util"></div></div>
+        <div class="rowA"><div class="nameA"><span class="ico img">▣</span><span>72.90元-付款记录-20260915.png</span></div>
+          <div class="val rng">全部</div><div class="val copies">1×</div><div class="util"></div></div>
+        <div class="rowA"><div class="nameA"><span class="ico pdf">▤</span><span>1148元-电子发票-上海华程西南国际旅行社有限公司-20260921.pdf</span></div>
+          <div class="val rng">全部</div><div class="val copies">1×</div><div class="util"></div></div>
+        <div class="rowA"><div class="nameA"><span class="ico img">▣</span><span>scan001.png</span></div>
+          <div class="val rng">全部</div><div class="val copies">1×</div><div class="util"></div></div>
+      </div>
+      <p class="sub" style="margin-top:10px;max-width:421px">
+        247pt 能装约 20 个汉字 / 41 个半角。上面前两条刚好装下，<b>第三条 1148 元那条仍然被截掉尾巴</b>。
+      </p>
+    </div>
+
+    <!-- B -->
+    <div>
+      <p class="label">方案 B · 44pt 两行 · 名字 261pt · 永不截断（推荐）</p>
+      <div class="pane">
+        <div class="head"><span class="t">文件队列</span><span class="sp"></span>
+          <span class="chip">清空</span><span class="chip pri">＋ 添加文件</span></div>
+        <div class="cols">
+          <div style="flex:1">文件名</div>
+          <div class="val rng">范围</div><div class="val copies">份数</div><div style="width:var(--util-w)"></div>
+        </div>
+        <div class="rule"></div>
+        <div class="rowB sel"><div class="nameB"><span class="ico pdf">▤</span>
+            <span class="t"><span class="l">72.90元-电子发票-中国铁路上海局集团有限公司-20260915.pdf</span></span></div>
+          <div class="val rng">全部</div><div class="val copies">1×</div><div class="util"></div></div>
+        <div class="rowB"><div class="nameB"><span class="ico img">▣</span>
+            <span class="t"><span class="l">72.90元-付款记录-20260915.png</span></span></div>
+          <div class="val rng">全部</div><div class="val copies">1×</div>
+          <div class="util"><i class="g">↺</i><i class="g">↻</i><i class="g">⊗</i></div></div>
+        <div class="rowB"><div class="nameB"><span class="ico pdf">▤</span>
+            <span class="t"><span class="l">1148元-电子发票-上海华程西南国际旅行社有限公司-20260921.pdf</span></span></div>
+          <div class="val rng">全部</div><div class="val copies">1×</div><div class="util"></div></div>
+        <div class="rowB"><div class="nameB"><span class="ico img">▣</span>
+            <span class="t"><span class="l">scan001.png</span></span></div>
+          <div class="val rng">全部</div><div class="val copies">1×</div><div class="util"></div></div>
+      </div>
+      <p class="sub" style="margin-top:10px;max-width:421px">
+        两行合计约 40 个汉字 / 82 个半角。真实队列里最长的名字也装得下，<b>不需要用户 hover 看 tooltip</b>。
+        第二行那三个行尾符号是鼠标悬停在该行时才出现的（上方付款记录那行就是悬停态）。
+      </p>
+    </div>
+
+  </div>
+
+  <!-- 旋转 -->
+  <p class="label" style="margin-top:6px">旋转在行尾到底长什么样 · 三种做法的实际渲染</p>
+  <div class="rotwrap">
+
+    <div>
+      <div class="mini">
+        <div class="rowC plain">
+          <div class="nameA"><span class="ico img">▣</span><span>72.90元-付款记录-20260915.png</span></div>
+          <div class="val rng">全部</div><div class="val copies">1×</div>
+          <div class="util"><i class="g">↺</i><i class="g">↻</i><i class="g">⊗</i></div>
+        </div>
+      </div>
+      <p class="cap"><b>A</b> · 常态 0pt：什么都不显示；hover 才浮出 <code>↺ ↻ ⊗</code>。缺点是你得先记得这里有东西。</p>
+    </div>
+
+    <div>
+      <div class="mini">
+        <div class="rowC plain">
+          <div class="nameA"><span class="ico img">▣</span><span>72.90元-付款记录-20260915.png</span></div>
+          <div class="val rng">全部</div><div class="val copies">1×</div>
+          <div class="util"><i class="g on">↻</i></div>
+        </div>
+        <div class="rowC">
+          <div class="nameA"><span class="ico img">▣</span><span>72.90元-付款记录-20260915.png</span></div>
+          <div class="val rng">全部</div><div class="val copies">1×</div>
+          <div class="util"><i class="g">↺</i><i class="g">↻</i><i class="g">⊗</i></div>
+        </div>
+      </div>
+      <p class="cap"><b>B（推荐）</b> · 常驻一个极淡的 <code>↻</code>（20pt）：一眼知道「这行能转」，但不抢注意力；hover 点亮成一对箭头。</p>
+    </div>
+
+    <div>
+      <div class="mini">
+        <div class="rowC plain">
+          <div class="nameA"><span class="ico img">▣</span><span>1148元-电子发票-上海华程西南国际旅行社有限公司-20260921.pdf</span></div>
+          <div class="val rng mod">1–2</div><div class="val copies mod">2×</div>
+          <div class="util"><span class="rot">↻ 90°</span></div>
+        </div>
+      </div>
+      <p class="cap">转过之后 · 行尾常显蓝色 <code>↻ 90°</code>（点它一键归零，和现在 v1.2 的行为一致），和 <code>1–2</code> / <code>2×</code> 一起构成「这行偏离了默认」。</p>
+    </div>
+
+    <div>
+      <div class="prevhead">
+        <div class="ph-top">预览<span class="sp"></span>A4 · 缩放 80%</div>
+        <div class="ph-acts">
+          <span class="tbtn">↺ 左转 90°</span>
+          <span class="tbtn">↻ 右转 90°</span>
+          <span class="tbtn on">↻ 已转 90° · 复位</span>
+          <span class="spacer"></span>
+          <span class="tbtn">适合页面</span><span class="tbtn">100%</span>
+        </div>
+        <div class="ph-body">当前选中：72.90元-电子发票-…pdf</div>
+      </div>
+      <p class="cap" style="max-width:521px">预览栏头部：作用于<b>当前选中</b>文件，永久在场。你是先在预览里看见「倒了」才想转的，入口就放在看得见问题的地方。</p>
+    </div>
+
+    <div>
+      <div class="mini" style="padding:14px 16px;box-sizing:border-box">
+        <div style="font-size:11.5px;color:var(--txt2);line-height:1.9">
+          <div style="font-size:10.5px;font-weight:600;color:var(--txt3);letter-spacing:.06em;margin-bottom:6px">右键菜单</div>
+          <div>左转 90°</div>
+          <div style="color:var(--accent)">右转 90°</div>
+          <div>复位方向</div>
+          <div style="height:.5px;background:rgba(0,0,0,.08);margin:6px 0"></div>
+          <div>设置页码范围…</div>
+          <div>移除</div>
+          <div>在访达中显示</div>
+        </div>
+      </div>
+      <p class="cap">行右键菜单：不占任何宽度，熟手路径，还能顺手放「设置页码范围 / 在访达中显示」。</p>
+    </div>
+
+  </div>
+
+  <div class="notes">
+    <div class="cols2">
+      <div class="col">
+        <span class="tag">回收了哪些宽度</span>
+        <ul>
+          <li><b>页数 44pt</b> → 删列。页数收进 tooltip，或作为文件名后的极淡小字</li>
+          <li><b>旋转 70pt</b> → 换成行尾一个淡 <code>↻</code>（约 20pt）；转过才常显 <code>↻ 90°</code></li>
+          <li><b>状态 44pt</b> → 删列。正常行不写字，转换中/失败才出声</li>
+          <li><b>删除 22pt</b> → hover 才出现</li>
+          <li>合计还给文件名约 <b>180pt</b>（43–80 → 261）</li>
+        </ul>
+      </div>
+      <div class="col">
+        <span class="tag">没做的事</span>
+        <ul>
+          <li>不解析文件名，不拆金额/类别/来源/日期</li>
+          <li>不加任何「发票 / 付款记录」这类业务分类</li>
+          <li>不按金额或类型重排，保持加入顺序</li>
+          <li>不改文件名本身，显示的就是磁盘上的真名</li>
+        </ul>
+        <span class="tag">要你定的三件事</span>
+        <ul>
+          <li>文件名：A 单行 还是 B 两行（我推荐 B）</li>
+          <li>旋转常驻：A 0pt 还是 B 淡 ↻ 20pt（我推荐 B）</li>
+          <li>页数：删掉，还是保留成文件名后的一行极淡小字</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>

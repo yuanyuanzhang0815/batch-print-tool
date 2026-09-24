@@ -5,7 +5,7 @@ set -e
 cd "$(dirname "$0")"
 SDK=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk
 APP="$HOME/Applications/批量打印工具.app"
-VERSION=1.2
+VERSION=1.3
 swiftc -parse-as-library -O -sdk "$SDK" -target arm64-apple-macos26.0 \
       -o build/BatchPrint src/App.swift
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -28,7 +28,7 @@ fi
   <key>CFBundleExecutable</key><string>BatchPrint</string>
   <key>CFBundleIdentifier</key><string>local.printtools.batchprint.v2</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.2</string>
+  <key>CFBundleShortVersionString</key><string>1.3</string>
   <key>CFBundleVersion</key><string>3</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>LSMinimumSystemVersion</key><string>26.0</string>

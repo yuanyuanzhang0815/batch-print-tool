@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>文件队列信息层级重构 v2（收敛版）</title>
+<style>
+  :root{
+    --pane: 421px;
+    --pad: 14px;
+    --rail: 54px;        /* 金额轨 */
+    --range-w: 62px;
+    --copies-w: 40px;
+    --util-w: 54px;      /* 右侧效用位 */
+    --row-h: 42px;
+    --bg: #ECECEE;
+    --sel: #E1E1E5;
+    --txt: #1D1D1F;
+    --txt2: #6E6E73;
+    --txt3: #9A9AA0;
+    --pdf: #D64539;
+    --img: #2979E0;
+    --office: #218C52;
+    --accent: #0A84FF;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:#F5F5F7;font-family:-apple-system,"SF Pro Text","Helvetica Neue",sans-serif;-webkit-font-smoothing:antialiased}
+  .stage{padding:26px 30px 44px}
+  h1{font-size:15px;font-weight:600;color:#1D1D1F;margin:0 0 4px}
+  .sub{font-size:11.5px;color:#6E6E73;margin:0 0 22px}
+  .label{font-size:10.5px;font-weight:600;color:#9A9AA0;letter-spacing:.06em;margin:0 0 8px}
+
+  .compare{display:flex;gap:26px;align-items:flex-start;flex-wrap:wrap;margin-bottom:26px}
+  .pane{width:var(--pane);border-radius:10px;overflow:hidden;background:var(--bg);
+        box-shadow:0 1px 2px rgba(0,0,0,.10),0 8px 22px rgba(0,0,0,.07)}
+  .head{height:42px;display:flex;align-items:center;gap:8px;padding:0 10px}
+  .head .t{font-size:11.5px;font-weight:500;color:var(--txt2)}
+  .head .sp{flex:1}
+  .chip{height:22px;border-radius:6px;display:flex;align-items:center;gap:4px;padding:0 9px;
+        font-size:11.5px;color:var(--txt);background:rgba(0,0,0,.055)}
+  .chip.pri{background:#fff;box-shadow:0 0 0 .5px rgba(0,0,0,.10),0 1px 1.5px rgba(0,0,0,.07)}
+  .cols{height:28px;display:flex;align-items:center;padding:0 var(--pad);
+        font-size:11px;font-weight:500;color:var(--txt2)}
+  .rule{height:1px;background:rgba(0,0,0,.06)}
+
+  /* 现状 */
+  .row{height:36px;display:flex;align-items:center;padding:0 var(--pad)}
+  .row.sel{background:var(--sel)}
+  .name36{flex:1;min-width:0;display:flex;align-items:center;gap:6px;font-size:12px}
+  .name36 span{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+  .now-w{width:44px;flex:none;text-align:center;font-size:12px;color:var(--txt2)}
+  .cell{text-align:center}
+  .c-32{width:32px}.c-44{width:44px}.c-74{width:74px}.c-70{width:70px}.c-56{width:56px}.c-22{width:22px}
+  .pill{font-size:11px;border-radius:5px;padding:2px 9px;background:rgba(0,0,0,.06);color:var(--txt2)}
+
+  /* 提案 */
+  .row2{height:var(--row-h);display:flex;align-items:center;padding:0 var(--pad);
+        border-bottom:.5px solid rgba(0,0,0,.035);position:relative}
+  .row2:last-child{border-bottom:none}
+  .row2.sel{background:var(--sel)}
+  .row2:hover{background:rgba(0,0,0,.045)}
+  .amt-rail{width:var(--rail);flex:none;text-align:right;padding-right:10px;
+            font-size:12px;color:var(--txt2);font-variant-numeric:tabular-nums;
+            letter-spacing:-.01em;white-space:nowrap}
+  .amt-rail.ftype{font-size:10px;font-weight:600;letter-spacing:.03em}
+  .id{flex:1;min-width:0;display:flex;align-items:center;gap:8px}
+  .id .txt{flex:1;min-width:0}
+  .l1{font-size:12px;color:var(--txt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+      line-height:15px;font-weight:600;letter-spacing:-.005em}
+  .l1.plain{font-weight:400}
+  .l2{display:flex;align-items:baseline;gap:8px;line-height:13px;font-size:10.5px;color:var(--txt3)}
+  .l2 .src{flex:1;min-width:0;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+  .l2 .date{flex:none;font-variant-numeric:tabular-nums}
+  .ico{width:13px;flex:none;text-align:center;font-size:12px}
+  .ico.pdf{color:var(--pdf)}.ico.img{color:var(--img)}.ico.office{color:var(--office)}
+
+  .val{flex:none;text-align:right;font-size:11.5px;color:var(--txt2);
+       font-variant-numeric:tabular-nums;padding-right:12px;white-space:nowrap}
+  .val.mod{color:var(--accent);font-weight:500}
+  .rng{width:var(--range-w)}.copies{width:var(--copies-w)}
+  .util{width:var(--util-w);flex:none;display:flex;align-items:center;justify-content:flex-end;gap:8px;
+        font-size:11.5px;color:var(--txt3)}
+  .util .g{opacity:0;transition:opacity .12s;color:#8A8A90}
+  .row2:hover .util .g{opacity:1}
+  .util .rot{font-size:11px;font-weight:500;color:var(--accent);opacity:1}
+  .util .warn{font-size:11px;color:#C0392B;opacity:1}
+  .util .spin{font-size:11px;color:var(--txt2);opacity:1}
+
+  /* 右侧预览头部（旋转主入口） */
+  .prevhead{margin-top:14px;width:520px;border-radius:10px;background:#fff;
+            box-shadow:0 1px 2px rgba(0,0,0,.08),0 6px 16px rgba(0,0,0,.05);overflow:hidden}
+  .ph-top{height:38px;display:flex;align-items:center;gap:10px;padding:0 14px;
+          font-size:11.5px;color:var(--txt2);border-bottom:.5px solid rgba(0,0,0,.06)}
+  .ph-top .sp{flex:1}
+  .ph-acts{height:38px;display:flex;align-items:center;gap:6px;padding:0 10px;background:rgba(0,0,0,.018)}
+  .tbtn{height:24px;border-radius:6px;display:flex;align-items:center;gap:5px;padding:0 9px;
+        font-size:11.5px;color:var(--txt);background:rgba(0,0,0,.05)}
+  .tbtn.on{background:rgba(10,132,255,.12);color:#0A6BD0;font-weight:500}
+  .tbtn .sp2{flex:1}
+  .ph-body{height:120px;display:flex;align-items:center;justify-content:center;
+           font-size:11px;color:var(--txt3);background:#FAFAFA}
+
+  .notes{max-width:1180px;font-size:12px;color:#3A3A3C;line-height:1.7;margin-top:8px}
+  .notes b{color:#1D1D1F}
+  .notes code{background:rgba(0,0,0,.055);padding:1px 4px;border-radius:3px;font-size:11px}
+  .tag{display:inline-block;font-size:10px;font-weight:600;padding:1px 6px;border-radius:4px;
+       background:rgba(0,0,0,.06);color:#6E6E73;margin-right:6px}
+  .cols2{display:flex;gap:34px;flex-wrap:wrap}
+  .col{max-width:520px}
+  ul{margin:6px 0 14px;padding-left:18px}
+</style>
+</head>
+<body>
+<div class="stage">
+
+  <h1>文件队列信息层级重构 v2 · 收敛版</h1>
+  <p class="sub">真实宽度 1:1（队列栏 421pt）。v2 相对 v1 的改动：金额进固定右对齐轨 · 类别升为主标题 · 第二行「来源 + 日期右贴边」· 砍真缩略图 · 状态只走右侧效用位 · 旋转主入口移到预览头部。</p>
+
+  <div class="compare">
+
+    <!-- 现状 -->
+    <div>
+      <p class="label">现状 · 36pt · 固定列 338pt</p>
+      <div class="pane">
+        <div class="head"><span class="t">文件队列</span><span class="sp"></span>
+          <span class="chip">清空</span><span class="chip pri">＋ 添加文件</span></div>
+        <div class="cols">
+          <div style="flex:1">文件名</div>
+          <div class="c-32 cell">页数</div><div class="c-74 cell">页码范围</div>
+          <div class="c-70 cell">旋转</div><div class="c-56 cell">份数</div><div class="c-44 cell">状态</div><div class="c-22"></div>
+        </div>
+        <div class="rule"></div>
+        <div class="row sel"><div class="name36"><span class="ico pdf">▤</span><span>72.90元-电子发票-中国…</span></div>
+          <div class="now-w">1</div><div class="c-74" style="display:flex;justify-content:center"><span class="pill">全部</span></div>
+          <div class="c-70 cell" style="color:var(--txt3)">—</div><div class="c-56 cell">1</div>
+          <div class="c-44 cell" style="color:var(--txt2)">就绪</div><div class="c-22 cell" style="color:var(--txt3)">⊗</div></div>
+        <div class="row"><div class="name36"><span class="ico img">▣</span><span>72.90元-付款记录-…</span></div>
+          <div class="now-w">1</div><div class="c-74" style="display:flex;justify-content:center"><span class="pill">全部</span></div>
+          <div class="c-70 cell" style="color:var(--txt3)">—</div><div class="c-56 cell">1</div>
+          <div class="c-44 cell" style="color:var(--txt2)">就绪</div><div class="c-22 cell" style="color:var(--txt3)">⊗</div></div>
+        <div class="row"><div class="name36"><span class="ico pdf">▤</span><span>661元-电子发票-中国…</span></div>
+          <div class="now-w">1</div><div class="c-74" style="display:flex;justify-content:center"><span class="pill">全部</span></div>
+          <div class="c-70 cell" style="color:var(--txt3)">—</div><div class="c-56 cell">1</div>
+          <div class="c-44 cell" style="color:var(--txt2)">就绪</div><div class="c-22 cell" style="color:var(--txt3)">⊗</div></div>
+        <div class="row"><div class="name36"><span class="ico img">▣</span><span>661元-付款记录-2026…</span></div>
+          <div class="now-w">1</div><div class="c-74" style="display:flex;justify-content:center"><span class="pill">全部</span></div>
+          <div class="c-70 cell" style="color:var(--txt3)">—</div><div class="c-56 cell">1</div>
+          <div class="c-44 cell" style="color:var(--txt2)">就绪</div><div class="c-22 cell" style="color:var(--txt3)">⊗</div></div>
+        <div class="row"><div class="name36"><span class="ico pdf">▤</span><span>1148元-电子发票-上海…</span></div>
+          <div class="now-w">1</div><div class="c-74" style="display:flex;justify-content:center"><span class="pill">全部</span></div>
+          <div class="c-70 cell" style="color:var(--txt3)">—</div><div class="c-56 cell">1</div>
+          <div class="c-44 cell" style="color:var(--txt2)">就绪</div><div class="c-22 cell" style="color:var(--txt3)">⊗</div></div>
+        <div class="row"><div class="name36"><span class="ico img">▣</span><span>1148元-付款记录-2026…</span></div>
+          <div class="now-w">1</div><div class="c-74" style="display:flex;justify-content:center"><span class="pill">全部</span></div>
+          <div class="c-70 cell" style="color:var(--txt3)">—</div><div class="c-56 cell">1</div>
+          <div class="c-44 cell" style="color:var(--txt2)">就绪</div><div class="c-22 cell" style="color:var(--txt3)">⊗</div></div>
+        <div class="row"><div class="name36"><span class="ico img">▣</span><span>scan001.png</span></div>
+          <div class="now-w">1</div><div class="c-74" style="display:flex;justify-content:center"><span class="pill">全部</span></div>
+          <div class="c-70 cell" style="color:var(--txt3)">—</div><div class="c-56 cell">1</div>
+          <div class="c-44 cell" style="color:var(--txt2)">就绪</div><div class="c-22 cell" style="color:var(--txt3)">⊗</div></div>
+        <div class="row"><div class="name36"><span class="ico office">▤</span><span>报销说明.docx</span></div>
+          <div class="now-w">1</div><div class="c-74" style="display:flex;justify-content:center"><span class="pill">全部</span></div>
+          <div class="c-70 cell" style="color:var(--txt3)">—</div><div class="c-56 cell">1</div>
+          <div class="c-44 cell" style="color:var(--txt2)">就绪</div><div class="c-22 cell" style="color:var(--txt3)">⊗</div></div>
+      </div>
+    </div>
+
+    <!-- v2 提案 -->
+    <div>
+      <p class="label">v2 提案 · 42pt · 金额轨 54 + 身份 + 值列 102 + 效用位 54</p>
+      <div class="pane">
+        <div class="head"><span class="t">文件队列</span><span class="sp"></span>
+          <span class="chip">清空</span><span class="chip pri">＋ 添加文件</span></div>
+        <div class="cols">
+          <div style="width:var(--rail);text-align:right;padding-right:10px">金额</div>
+          <div style="flex:1">文件</div>
+          <div class="val" style="width:var(--range-w)">范围</div>
+          <div class="val" style="width:var(--copies-w)">份数</div>
+          <div style="width:var(--util-w)"></div>
+        </div>
+        <div class="rule"></div>
+
+        <div class="row2 sel">
+          <div class="amt-rail">72.90</div>
+          <div class="id"><span class="ico pdf">▤</span>
+            <div class="txt"><div class="l1">电子发票</div>
+              <div class="l2"><span class="src">中国铁路上海局</span><span class="date">09/15</span></div></div></div>
+          <div class="val rng">全部</div><div class="val copies">1×</div><div class="util"></div>
+        </div>
+
+        <div class="row2">
+          <div class="amt-rail">72.90</div>
+          <div class="id"><span class="ico img">▣</span>
+            <div class="txt"><div class="l1">付款记录</div>
+              <div class="l2"><span class="src"></span><span class="date" style="margin-left:auto">09/15</span></div></div></div>
+          <div class="val rng">全部</div><div class="val copies">1×</div><div class="util"></div>
+        </div>
+
+        <div class="row2">
+          <div class="amt-rail">661</div>
+          <div class="id"><span class="ico pdf">▤</span>
+            <div class="txt"><div class="l1">电子发票</div>
+              <div class="l2"><span class="src">中国国家铁路</span><span class="date">09/14</span></div></div></div>
+          <div class="val rng">全部</div><div class="val copies">1×</div><div class="util"></div>
+        </div>
+
+        <!-- hover：效用位出声 -->
+        <div class="row2" style="background:rgba(0,0,0,.045)">
+          <div class="amt-rail">661</div>
+          <div class="id"><span class="ico img">▣</span>
+            <div class="txt"><div class="l1">付款记录</div>
+              <div class="l2"><span class="src"></span><span class="date" style="margin-left:auto">09/11</span></div></div></div>
+          <div class="val rng">全部</div><div class="val copies">1×</div>
+          <div class="util"><span class="g" style="opacity:1">↺</span><span class="g" style="opacity:1">↻</span><span class="g" style="opacity:1">⊗</span></div>
+        </div>
+
+        <!-- 改过设置：蓝色只代表偏离默认 -->
+        <div class="row2">
+          <div class="amt-rail">1148</div>
+          <div class="id"><span class="ico pdf">▤</span>
+            <div class="txt"><div class="l1">电子发票</div>
+              <div class="l2"><span class="src">上海华程西南国旅</span><span class="date">09/21</span></div></div></div>
+          <div class="val rng mod">1–2</div><div class="val copies mod">2×</div>
+          <div class="util"><span class="rot">↻ 90°</span></div>
+        </div>
+
+        <!-- 解析失败：金额轨改放类型 -->
+        <div class="row2">
+          <div class="amt-rail ftype" style="color:var(--txt3)">PNG</div>
+          <div class="id"><span class="ico img">▣</span>
+            <div class="txt"><div class="l1 plain">scan001</div>
+              <div class="l2"><span class="src">2480 × 3508</span><span class="date">3.2 MB</span></div></div></div>
+          <div class="val rng">全部</div><div class="val copies">1×</div><div class="util"></div>
+        </div>
+
+        <!-- 异常：只在效用位出声，身份区不抖 -->
+        <div class="row2">
+          <div class="amt-rail ftype" style="color:var(--txt3)">DOC</div>
+          <div class="id"><span class="ico office">▤</span>
+            <div class="txt"><div class="l1 plain">报销说明.docx</div>
+              <div class="l2"><span class="src"></span><span class="date"></span></div></div></div>
+          <div class="val rng">全部</div><div class="val copies">1×</div>
+          <div class="util"><span class="spin">⟳</span></div>
+        </div>
+
+      </div>
+      <p class="sub" style="margin-top:10px;max-width:421px">
+        身份区 <b>183pt</b>（金额轨 54 + 身份 183 = 237pt 给「这是哪一笔的哪一类」）。
+        正常行右侧完全安静；蓝色只表示「偏离默认」。
+      </p>
+    </div>
+
+    <!-- 预览头部 -->
+    <div>
+      <p class="label">旋转主入口 · 预览头部</p>
+      <div class="prevhead">
+        <div class="ph-top">预览<span class="sp"></span>A4 · 缩放 80%</div>
+        <div class="ph-acts">
+          <span class="tbtn">↺ 左转 90°</span>
+          <span class="tbtn">↻ 右转 90°</span>
+          <span class="tbtn on">↻ 已转 90° · 复位</span>
+          <span class="sp2"></span>
+          <span class="tbtn">适合页面</span>
+          <span class="tbtn">100%</span>
+        </div>
+        <div class="ph-body">当前选中：72.90元 · 电子发票 · 中国铁路上海局</div>
+      </div>
+      <p class="sub" style="margin-top:10px;max-width:520px">
+        永远在场、不靠 hover 也不靠记忆。旋转是方向问题，用户在预览里才发现「倒了」，入口就该在这儿（辅入口：行右键菜单）。
+      </p>
+    </div>
+
+  </div>
+
+  <div class="notes">
+    <div class="cols2">
+      <div class="col">
+        <span class="tag">v2 相对 v1 的四条修正</span>
+        <ul>
+          <li><b>金额进固定右对齐轨</b>（54pt，tabular figures，弱字重）。重复金额自动垂直对齐 → 不用加粗、不用 section header，分组感由排版自己长出来。正文里不再重复金额。</li>
+          <li><b>类别升为主标题</b>（semibold）。真正的区分信息是「电子发票 / 付款记录 / 订单截图」，不是金额。</li>
+          <li><b>砍真缩略图</b>（22pt 里 PDF 只是白纸、截图只是花花小块，不承担识别任务却吃 29pt），金额轨接管这个前导槽位；解析失败时改放文件类型。</li>
+          <li><b>砍「中国铁路上海局 · 09/15」这种句子式第二行</b>，改成「来源左贴边吃弹性 + 日期右贴边」，日期变成稳定的竖向扫描点，来源再长也不会把日期挤跑。</li>
+        </ul>
+      </div>
+      <div class="col">
+        <span class="tag">四类状态语义（不许串）</span>
+        <ul>
+          <li><b>selected</b> = 这是谁（浅色 inset 底，对应右侧预览）</li>
+          <li><b>hover</b> = 手在哪（更浅的底 + 效用位出声）</li>
+          <li><b>modified</b> = 偏离默认（蓝色值，别再加粗加饱和）</li>
+          <li><b>processing / error</b> = 机器事实（只在右侧效用位，身份区永远不抖）</li>
+        </ul>
+        <span class="tag">一条还没解决的张力</span>
+        <ul>
+          <li>「Success is silent」被用来干掉 <code>就绪</code>，但 <code>全部</code> / <code>1×</code> 同样每行都在喊。我的暂定判据：<b>机器事实静默，用户决定常显</b> —— 状态是机器说的，范围/份数是用户自己定的，所以后者该常驻。</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>
