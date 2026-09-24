@@ -58,6 +58,15 @@ open -a ~/Applications/批量打印工具.app
 - **图片不是另一条流水线**：图片按 DPI 元数据换算成点尺寸后，用与 PDF **完全相同**的缩放/纸张/页边距数学画进 PDF，所以行为一致、只有一套逻辑。
 - **Office 转换**：`soffice --headless --convert-to pdf`，按「转换器版本 + 路径 + mtime」缓存到 `~/Library/Caches/local.printtools.batchprint/office/`。
 - **LibreOffice 中文乱码**：headless 模式下它在本机的字体发现是坏的（找不到系统 CJK 字体，中文渲染成空白/方块）。修法是注入一份指向 `/System/Library/Fonts` 的 `FONTCONFIG_FILE`，见 `ensureFontConfig()`。
+- **渲染必须全部走同一个串行后台队列**（`renderQueue` / `renderOffMain` / `BatchPlan`）：
+  ① PDF 解码、图片解码、Office → PDF（LibreOffice，1–3 秒/文件）都是**同步阻塞**的，
+  留在主线程会让整个窗口卡住——转一下旋转、预览一个 Office 文件都会顿；导出/打印批量渲染也一样。
+  ② LibreOffice 用同一个 user profile，**不能并发跑两个实例**（会抢锁），
+  所以串行化不只是性能，是正确性。渲染参数先快照成 `BatchPlan` 再带到后台，避免竞态。
+- **防抖要把「取消」当真**：预览有 60ms 防抖，但 `try? await Task.sleep` 被取消后
+  还会继续往下跑（取消错误被 `try?` 吃掉了），连续点几次旋转就等于排队渲染几次，
+  手感变成「点了没反应」。现在 sleep 之后和后台渲染回来之后都补了 `Task.isCancelled` 检查，
+  旧图不会盖住新图。
 - **光标接管**：`TextField` 获得焦点后 field editor 会把全局光标置成 I-beam，而鼠标离开时没有可靠复位（`cursorUpdate` tracking area 为 0）。AppKit 每次 mousemove 又用 cursor rect 覆盖回来，所以只在事件监听里 `set()` 无效。最终做法是 `window.disableCursorRects()` **接管光标管理**，自己按命中视图决定。
 - **打印**：走 CUPS 的 `lp`（macOS 自带开源打印系统），不做任何 GUI 打印栈依赖；驱动层面的按比例缩放不可靠，因此缩放由本工具在生成 PDF 时完成。
 - **旋转不要动画**：试过让预览图「转过去」（新图先无动画放在旧角度，再动画回 0；先弹簧、后 220ms ease-in-out），实测**生硬且多余**。旋转是精确几何变换，内容自己换了朝向已经说明一切；旋转本身是每天几十次的操作，按 animate 的 frequency 门应该近乎无感。现在只保留图本身的 opacity 交叉淡入（`easeOut 0.18s`）。
@@ -103,6 +112,11 @@ env BATCHPRINT_SAMPLE_DIR=$D BATCHPRINT_DEMO=rotate BATCHPRINT_SNAPSHOT=/tmp/s3.
 env BATCHPRINT_SAMPLE_DIR=$D BATCHPRINT_DEMO=stress BATCHPRINT_SNAPSHOT=/tmp/s4.png "$B" # 非法范围+份数3
 env BATCHPRINT_SAMPLE_DIR=$D BATCHPRINT_DARK=1    BATCHPRINT_SNAPSHOT=/tmp/s5.png "$B"   # 深色
 env BATCHPRINT_SNAPSHOT=/tmp/s6.png "$B"                                                  # 空态
+
+# 批量渲染路径（导出/打印共用那条）也要能被无头验证：
+# NSOpenPanel 没法自动化，所以给一个直接指定输出目录的钩子
+env BATCHPRINT_SAMPLE_DIR=$D BATCHPRINT_EXPORT_DIR=/tmp/bpexp "$B"                        # 11 个 PDF（行程单 2 页 → 12 页）
+env BATCHPRINT_SAMPLE_DIR=$D BATCHPRINT_DEMO=stress BATCHPRINT_EXPORT_DIR=/tmp/bpexp "$B"  # 份数 3 的行多出 -c1/-c2
 ```
 
 - `BATCHPRINT_HOVER=1` 会让**所有行**同时进入 hover 态（方便一次看全 hover 样式），
@@ -111,6 +125,8 @@ env BATCHPRINT_SNAPSHOT=/tmp/s6.png "$B"                                        
 - `BATCHPRINT_SNAPSHOT_DELAY`（默认 2.2 秒）要大于样本文档的 LibreOffice 转换耗时，否则会拍到空队列。
 - 出图后用 `seeimg` 看图自检之外，**布局类改动要用像素量**（列右缘、间距、符号是否存在），
   静态看图看不出「图标被压成 0 宽」这种问题。
+- 统计导出结果别用 `mdls`（/tmp 不被 Spotlight 索引，返回 null），用 `CGPDFDocument.numberOfPages` 数页数才准。
+- 输出重定向到文件时 stdout 是**全缓冲**，进程被 kill 会丢日志；钩子里加 `fflush(stdout)`。
 
 ## 目录
 

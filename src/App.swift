@@ -416,20 +416,24 @@ final class Model: ObservableObject {
         flash("已清空文件队列")
     }
 
-    func scaleAll(to dir: URL) -> [URL] {
-        var outs: [URL] = []
-        for it in items {
-            let want = parseRange(it.range, total: it.pages)
-            for copy in 0..<max(1, it.copies) {
-                let suffix = it.copies > 1 ? "-c\(copy + 1)" : ""
-                if let o = scaledPDF(input: it.url, outDir: dir, mode: mode, percent: percent,
-                                     pages: want, suffix: suffix, paper: paper, margin: margin,
-                                     rotation: it.rotation) {
-                    outs.append(o)
-                }
-            }
+    /// 把当前队列 + 打印设置快照成一份可带到后台的渲染计划。
+    func batchPlan() -> BatchPlan {
+        BatchPlan(items: items.map { it in
+            BatchPlan.Item(url: it.url,
+                           pages: parseRange(it.range, total: it.pages),
+                           copies: it.copies,
+                           rotation: it.rotation)
+        }, mode: mode, percent: percent, paper: paper, margin: margin)
+    }
+
+    /// 导出 / 打印共用的「渲染一批文件」路径：一律走串行渲染队列，不占主线程。
+    /// `Task { @MainActor in }` 保证 await 回来后仍在主线程改 @Published 状态。
+    func renderBatchAsync(_ dir: URL, done: @escaping @MainActor ([URL]) -> Void) {
+        let plan = batchPlan()
+        Task { @MainActor in
+            let outs = await renderOffMain { scaledAll(plan, to: dir) }
+            done(outs)
         }
-        return outs
     }
 
     func doExport() {
@@ -441,8 +445,12 @@ final class Model: ObservableObject {
         let r = p.runModal()
         resetCursorRects()
         guard r == .OK, let dir = p.urls.first else { return }
-        let outs = scaleAll(to: dir)
-        flash(outs.isEmpty ? "导出失败，检查 PDF 是否损坏" : "已导出 \(outs.count) 个文件 → \(dir.lastPathComponent)")
+        busy = true
+        renderBatchAsync(dir) { outs in
+            self.busy = false
+            self.flash(outs.isEmpty ? "导出失败，检查 PDF 是否损坏"
+                                    : "已导出 \(outs.count) 个文件 → \(dir.lastPathComponent)")
+        }
     }
 
     func doPrint() {
@@ -450,25 +458,26 @@ final class Model: ObservableObject {
         guard !printer.isEmpty else { flash("没找到打印机"); return }
         busy = true
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("bp-\(UUID().uuidString)")
-        let outs = scaleAll(to: tmp)
-        guard !outs.isEmpty else {
-            busy = false
-            flash("生成失败，检查 PDF 是否损坏", seconds: 6)
-            return
-        }
-        var args = ["-d", printer, "-o", "Collate=\(outs.count > 1 ? "True" : "False")"]
-        if duplex { args += ["-o", "sides=two-sided-long-edge"] }
-        args += outs.map { $0.path }
-        let out = runCmd("/usr/bin/lp", args)
-        busy = false
-        let ok = out.lowercased().contains("request id") || out.contains("请求id")
-            || out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        if ok {
-            for i in items.indices { items[i].status = .sent }
-            flash("已发送到 \(shortPrinter(printer))：\(outs.count) 个文件 / \(totalSheets) 页")
-        } else {
-            for i in items.indices { items[i].status = .failed }
-            flash("打印失败：\(out.prefix(90))", seconds: 8)
+        renderBatchAsync(tmp) { outs in
+            guard !outs.isEmpty else {
+                self.busy = false
+                self.flash("生成失败，检查 PDF 是否损坏", seconds: 6)
+                return
+            }
+            var args = ["-d", self.printer, "-o", "Collate=\(outs.count > 1 ? "True" : "False")"]
+            if self.duplex { args += ["-o", "sides=two-sided-long-edge"] }
+            args += outs.map { $0.path }
+            let out = runCmd("/usr/bin/lp", args)
+            self.busy = false
+            let ok = out.lowercased().contains("request id") || out.contains("请求id")
+                || out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            if ok {
+                for i in self.items.indices { self.items[i].status = .sent }
+                self.flash("已发送到 \(shortPrinter(self.printer))：\(outs.count) 个文件 / \(self.totalSheets) 页")
+            } else {
+                for i in self.items.indices { self.items[i].status = .failed }
+                self.flash("打印失败：\(out.prefix(90))", seconds: 8)
+            }
         }
     }
 }
@@ -639,6 +648,53 @@ enum RowMetrics {
     }
 }
 
+// ── 渲染队列 ───────────────────────────────────────────
+// 所有 PDF/图片解码、Office → PDF 转换都必须走这一个**串行后台队列**：
+//   ① 这些调用是同步阻塞的（Office 还要跑 LibreOffice，1–3 秒/文件），
+//      留在主线程会让整个窗口卡住 —— 转一下旋转、换一个文件都会顿。
+//   ② LibreOffice 用同一个 user profile，并发跑两个实例会互相抢锁，
+//      所以串行化不只是为了性能，也是正确性问题。
+let renderQueue = DispatchQueue(label: "local.printtools.render", qos: .userInitiated)
+
+/// 把一段同步渲染搬到串行后台队列上跑；`await` 返回后仍回到调用者所在的 actor。
+func renderOffMain<T>(_ work: @escaping () -> T) async -> T {
+    await withCheckedContinuation { cont in
+        renderQueue.async { cont.resume(returning: work()) }
+    }
+}
+
+/// 批量渲染所需的全部参数（队列 + 打印设置的值快照）。
+/// 快照的意义：带到后台之后，用户在渲染过程中改队列 / 改设置都不会出竞态。
+struct BatchPlan {
+    struct Item {
+        let url: URL
+        let pages: [Int]
+        let copies: Int
+        let rotation: Int
+    }
+    let items: [Item]
+    let mode: ScaleMode
+    let percent: Double
+    let paper: PaperSize
+    let margin: MarginMode
+}
+
+/// 纯函数，可以在任意线程跑（只碰传入的参数，不碰 model）。
+func scaledAll(_ plan: BatchPlan, to dir: URL) -> [URL] {
+    var outs: [URL] = []
+    for it in plan.items {
+        for copy in 0..<max(1, it.copies) {
+            let suffix = it.copies > 1 ? "-c\(copy + 1)" : ""
+            if let o = scaledPDF(input: it.url, outDir: dir, mode: plan.mode, percent: plan.percent,
+                                 pages: it.pages, suffix: suffix, paper: plan.paper,
+                                 margin: plan.margin, rotation: it.rotation) {
+                outs.append(o)
+            }
+        }
+    }
+    return outs
+}
+
 // ── 主界面：文件队列 34% ｜ 打印设置 23% ｜ 预览 43% ─────
 struct ContentView: View {
     var sampleDir: String? = nil
@@ -704,6 +760,17 @@ struct ContentView: View {
                 model.items[0].rotation = 90
                 if model.items.count > 1 { model.items[1].rotation = 270 }
                 model.current = 0   // 让预览头部的「已转 90° · 复位」也能被快照盖到
+            }
+            // 导出路径（走渲染队列的那条）也要能被无头验证：
+            // NSOpenPanel 没法自动化，所以给一个直接指定输出目录的钩子
+            if let out = ProcessInfo.processInfo.environment["BATCHPRINT_EXPORT_DIR"] {
+                let dir = URL(fileURLWithPath: out)
+                try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                model.renderBatchAsync(dir) { outs in
+                    let files = (try? FileManager.default.contentsOfDirectory(atPath: out)) ?? []
+                    print("EXPORT OK \(outs.count) files -> \(files.sorted())")
+                    fflush(stdout)   // 输出重定向到文件时是全缓冲，不 flush 会被 kill 掉
+                }
             }
         }
     }
@@ -1335,11 +1402,21 @@ struct PreviewPane: View {
         .task(id: key) {
             guard let it = item else { image = nil; return }
             try? await Task.sleep(nanoseconds: 60_000_000)
+            // 防抖：这一帧已经被后一次点击取代了就别再渲染。
+            // （以前 `try? await Task.sleep` 被取消后还会继续往下跑，
+            //   连续转几次就等于排队渲染好几次，手感是「点了没反应」）
+            guard !Task.isCancelled else { return }
             let want = parseRange(it.range, total: it.pages)
             let src = want.indices.contains(page - 1) ? want[page - 1] : (want.first ?? 1)
-            let next = renderPage(url: it.url, mode: model.mode, percent: model.percent,
-                                  sourcePage: src, paper: model.paper, margin: model.margin,
-                                  rotation: it.rotation)
+            // 值快照：渲染在后台线程跑，不能再碰 model
+            let (u, m, pc, pp, mg, rt) = (it.url, model.mode, model.percent,
+                                          model.paper, model.margin, it.rotation)
+            let next = await renderOffMain {
+                renderPage(url: u, mode: m, percent: pc, sourcePage: src,
+                           paper: pp, margin: mg, rotation: rt)
+            }
+            // 回来后再确认一次：后台渲染期间用户可能又点了，别用旧图盖住新图
+            guard !Task.isCancelled else { return }
             // 不做「转过去」的动画：旋转是精确几何变换，内容自己换了朝向已经说明了一切，
             // 再叠一个 90° 旋转既生硬又多余（旋转本身是 tens/day 的操作，应近乎无感）。
             // 图本身还是带 opacity 交叉淡入的（.animation(.easeOut, value: key)）。
