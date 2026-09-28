@@ -472,6 +472,7 @@ final class Model: ObservableObject {
             }
             var args = ["-d", self.printer, "-o", "Collate=\(outs.count > 1 ? "True" : "False")"]
             if self.duplex { args += ["-o", "sides=two-sided-long-edge"] }
+            else { args += ["-o", "sides=one-sided"] }
             args += outs.map { $0.path }
             let out = runCmd("/usr/bin/lp", args)
             self.busy = false
