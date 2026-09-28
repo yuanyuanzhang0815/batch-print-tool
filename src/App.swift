@@ -1,6 +1,8 @@
 import SwiftUI
 import CoreGraphics
 import UniformTypeIdentifiers
+import Network
+import Combine
 
 // ── 常量 ────────────────────────────────────────────────
 enum PaperSize: String, CaseIterable, Identifiable {
@@ -38,7 +40,7 @@ func runCmd(_ path: String, _ args: [String], env extra: [String: String]? = nil
     return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
 }
 
-func listPrinters() -> (names: [String], def: String?) {
+func listPrinters() -> (names: [String], def: String?, uris: [String: String]) {
     var res: [String] = []
     for line in runCmd("/usr/bin/lpstat", ["-p"]).split(separator: "\n") {
         var rest: Substring
@@ -52,7 +54,114 @@ func listPrinters() -> (names: [String], def: String?) {
     var def: String?
     for n in res where dOut.contains(n) { def = n; break }
     if def == nil, res.count == 1 { def = res[0] }
-    return (res, def)
+    // 设备 URI（判断可达性用）：按 URI 特征而非本地化标签解析，任何语言下都成立
+    var uris: [String: String] = [:]
+    let vOut = runCmd("/usr/bin/lpstat", ["-v"])
+    for line in vOut.split(separator: "\n") where line.contains("://") {
+        if let r = line.range(of: "[a-z]+://[^\\s]+", options: .regularExpression) {
+            let uri = String(line[r])
+            for q in res where line.contains(q) { uris[q] = uri }
+        }
+    }
+    return (res, def, uris)
+}
+
+// ── 打印机网络可达性检测 ─────────────────────────────────
+// 背景：lp 提交后 CUPS 静默排队，打印机不在网络里时用户看到「已发送」却没纸出来。
+// 这里只探测「当前网络能不能发现/连上它」，不判断墨量/卡纸（做不到，也不拦发送）。
+enum ReachState: Equatable {
+    case unknown        // 还没检测（无 URI 信息等）
+    case checking       // 正在检测
+    case ok             // 当前网络可达
+    case unreachable    // 当前网络未发现打印机
+
+    var label: String {
+        switch self {
+        case .unknown: return ""
+        case .checking: return "正在检测网络…"
+        case .ok: return "当前网络可达"
+        case .unreachable: return "当前网络未发现打印机"
+        }
+    }
+}
+
+/// 按设备 URI 的 scheme 分流探测。2-3 秒内出结果，必须异步调用。
+/// - dnssd://  → Bonjour 浏览，实例名精确匹配（NWBrowser）
+/// - ipp/ipps: → TCP 631 直连
+/// - socket://  → TCP 9100 直连
+/// - usb://     → 恒可达（USB 不存在「换网络」问题）
+func probeReachable(_ uri: String?, timeout: Double = 3.0) async -> ReachState {
+    guard let uri, !uri.isEmpty else { return .unknown }
+    if uri.hasPrefix("usb://") { return .ok }
+    if uri.hasPrefix("dnssd://") {
+        // dnssd://HP%20LaserJet…%20%5B84523F%5D._ipp._tcp.local./?uuid=…
+        // → 实例名 = URL 解码后去掉 "._ipp._tcp.local." 后缀、去掉 ?query
+        var s = String(uri.dropFirst("dnssd://".count))
+        if let q = s.firstIndex(of: "?") { s = String(s[..<q]) }
+        // reg type 可能是 _ipp._tcp / _ipps._tcp / 带 subtype，统一取倒数第二、三段
+        let parts = s.split(separator: ".", omittingEmptySubsequences: false).map(String.init)
+        // 倒着找 "_tcp"，它前面一段是 regtype，再前面就是实例名
+        guard let tcpIdx = parts.lastIndex(where: { $0 == "_tcp" }),
+              tcpIdx >= 1 else { return .unknown }
+        let regType = parts[tcpIdx - 1]
+        let instance = parts.prefix(tcpIdx - 1).joined(separator: ".")
+        guard let decoded = instance.removingPercentEncoding, !decoded.isEmpty else { return .unknown }
+        return await withCheckedContinuation { cont in
+            var settled = false
+            var found = false
+            let browser = NWBrowser(for: .bonjour(type: regType.hasPrefix("_") ? "\(regType)._tcp" : "_\(regType)._tcp",
+                                                  domain: "local"), using: .tcp)
+            func finish(_ s: ReachState) {
+                guard !settled else { return }
+                settled = true
+                browser.cancel()
+                cont.resume(returning: s)
+            }
+            browser.browseResultsChangedHandler = { results, _ in
+                for r in results {
+                    if case let .service(name, _, _, _) = r.endpoint, name == decoded { found = true }
+                }
+                // 发现即提前结束，不等满超时
+                if found { finish(.ok) }
+            }
+            browser.stateUpdateHandler = { state in
+                if case .failed = state { finish(found ? .ok : .unreachable) }
+            }
+            browser.start(queue: .global())
+            DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { finish(found ? .ok : .unreachable) }
+        }
+    }
+    // ipp://host:631/path 或 ipps:// 或 socket://host:9100/ —— 直接 TCP 探测
+    var host = "", port: UInt16 = 631
+    let body = uri.contains("://") ? String(uri.split(separator: "://", maxSplits: 1)[1]) : uri
+    let hostPort = body.split(separator: "/").first.map(String.init) ?? ""
+    if hostPort.contains(":") {
+        let hp = hostPort.split(separator: ":")
+        host = String(hp[0])
+        port = UInt16(hp[1]) ?? 631
+    } else { host = hostPort }
+    if uri.hasPrefix("socket://") { port = 9100 }
+    guard !host.isEmpty, host != "localhost" else { return uri.hasPrefix("usb") ? .ok : .unknown }
+    return await withCheckedContinuation { cont in
+        var settled = false
+        let conn = NWConnection(host: NWEndpoint.Host(host), port: NWEndpoint.Port(rawValue: port)!,
+                                using: .tcp)
+        func finish(_ ok: Bool) {
+            guard !settled else { return }
+            settled = true
+            conn.cancel()
+            cont.resume(returning: ok ? .ok : .unreachable)
+        }
+        conn.stateUpdateHandler = { state in
+            switch state {
+            case .ready: finish(true)
+            case .failed, .cancelled: finish(false)
+            default: break
+            }
+        }
+        conn.start(queue: .global())
+        DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { finish(false) }
+    }
 }
 
 // ── 缩放：每页按百分比缩放，按纸张 / 页边距定位 ──────────
@@ -338,6 +447,7 @@ func parseRange(_ s: String, total: Int) -> [Int] {
 
 // ── 状态 ────────────────────────────────────────────────
 final class Model: ObservableObject {
+    private var cancellables = Set<AnyCancellable>()
     @Published var items: [PrintItem] = []
     @Published var mode: ScaleMode = .custom
     @Published var percent: Double = 80
@@ -349,22 +459,67 @@ final class Model: ObservableObject {
     @Published var current = 0
     @Published var message = ""
     @Published var busy = false
+    @Published var reach: ReachState = .unknown
+    private var printerURIs: [String: String] = [:]
+    private var reachTask: Task<Void, Never>?
     private var flashToken = 0
 
     init() {
+        // 全局默认缩放：用户「存为默认」过的模式+比例优先于出厂值（custom 80%）
+        let ud = UserDefaults.standard
+        if let m = ud.string(forKey: "bp.defaultScaleMode"), let saved = ScaleMode(rawValue: m) { mode = saved }
+        if ud.object(forKey: "bp.defaultScalePercent") != nil {
+            percent = min(100, max(50, ud.double(forKey: "bp.defaultScalePercent")))
+        }
         let r = listPrinters()
         printers = r.names
         printer = r.def ?? r.names.first ?? ""
+        printerURIs = r.uris
         // 快照 / 演示用：覆盖本机真实打印机名，
         // 否则截图里会带出「型号 + 序列号」这种个人设备信息。
         if let fake = ProcessInfo.processInfo.environment["BATCHPRINT_PRINTER"] {
             printers = [fake]
             printer = fake
         }
+        // 快照 / 演示用：强制指定可达性状态（ok/unreachable/checking），
+        // 否则真实探测 2-3s，截图时机不可控。
+        let reachOverride = ProcessInfo.processInfo.environment["BATCHPRINT_REACH"]
+        if reachOverride == "ok" { reach = .ok }
+        else if reachOverride == "unreachable" { reach = .unreachable }
+        else if reachOverride == "checking" { reach = .checking }
+        else { checkReach() }
+        // 切换打印机时自动重检
+        $printer
+            .dropFirst()
+            .removeDuplicates()
+            .sink { [weak self] _ in self?.checkReach() }
+            .store(in: &cancellables)
+    }
+
+    /// 可达性检测：串行去重，切打印机/手动重检都会走这里
+    func checkReach() {
+        reachTask?.cancel()
+        let uri = printerURIs[printer]
+        guard printer != "" else { reach = .unknown; return }
+        if uri == nil { reach = .unknown; return }
+        reach = .checking
+        reachTask = Task { @MainActor in
+            let state = await probeReachable(uri)
+            guard !Task.isCancelled else { return }
+            withAnimation(motion(false)) { reach = state }
+        }
     }
 
     var totalSheets: Int {
         items.reduce(0) { $0 + parseRange($1.range, total: $1.pages).count * max(1, $1.copies) }
+    }
+
+    /// 把当前缩放模式+比例存为启动默认值（持久化）
+    func saveDefaultScale() {
+        let ud = UserDefaults.standard
+        ud.set(mode.rawValue, forKey: "bp.defaultScaleMode")
+        ud.set(percent, forKey: "bp.defaultScalePercent")
+        flash("已存为默认缩放：\(mode.rawValue)\(mode == .custom ? " \(Int(percent))%" : "")")
     }
 
     func flash(_ s: String, seconds: Double = 2.4) {
@@ -480,7 +635,13 @@ final class Model: ObservableObject {
                 || out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             if ok {
                 for i in self.items.indices { self.items[i].status = .sent }
-                self.flash("已发送到 \(shortPrinter(self.printer))：\(outs.count) 个文件 / \(self.totalSheets) 页")
+                let base = "已发送到 \(shortPrinter(self.printer))：\(outs.count) 个文件 / \(self.totalSheets) 页"
+                // 打印机不在当前网络：lp 仍会提交成功，CUPS 静默排队。是提示不是拦截。
+                if self.reach == .unreachable {
+                    self.flash("\(base)。打印机不在当前网络：任务已加入队列，连上后自动打印", seconds: 6)
+                } else {
+                    self.flash(base)
+                }
             } else {
                 for i in self.items.indices { self.items[i].status = .failed }
                 self.flash("打印失败：\(out.prefix(90))", seconds: 8)
@@ -645,10 +806,12 @@ func paneTitle(_ t: String) -> some View {
 /// 结果文本会溢出自己的列压到「范围」pill 下面。硬约束 + clipped 才治得住。
 enum RowMetrics {
     static let hPad: CGFloat = 14          // 行左右内边距
+    static let rotateSlot: CGFloat = 60   // 旋转槽：↺ 角度 ↻（v1.2 体感回归：两个方向钮都常驻）
     static let rangeSlot: CGFloat = 50     // 范围槽（比内容宽，留出与文件名的呼吸间距）
     static let copiesSlot: CGFloat = 62    // 份数槽
-    static let utilSlot: CGFloat = 62      // 行尾效用位
-    static var right: CGFloat { rangeSlot + copiesSlot + utilSlot }
+    static let statusSlot: CGFloat = 52    // 状态槽：「已发送」徽章完整显示 + 呼吸空间
+    static let delSlot: CGFloat = 22       // 删除位：hover 才出现（v1.3 行为，换取文件名宽度）
+    static var right: CGFloat { rotateSlot + rangeSlot + copiesSlot + statusSlot + delSlot }
 
     static func nameWidth(paneWidth: CGFloat) -> CGFloat {
         max(96, paneWidth - hPad * 2 - right)
@@ -841,9 +1004,11 @@ struct FileTable: View {
     private var columns: some View {
         HStack(spacing: 0) {
             Text("文件").frame(width: nameWidth, alignment: .leading)
+            Text("旋转").frame(width: RowMetrics.rotateSlot, alignment: .center)
             Text("范围").padding(.trailing, 8).frame(width: RowMetrics.rangeSlot, alignment: .trailing)
             Text("份数").padding(.trailing, 8).frame(width: RowMetrics.copiesSlot, alignment: .trailing)
-            Text("").frame(width: RowMetrics.utilSlot)
+            Text("状态").frame(width: RowMetrics.statusSlot, alignment: .leading)
+            Text("").frame(width: RowMetrics.delSlot)
         }
         .font(.system(size: 11, weight: .medium))
         .foregroundStyle(.secondary)
@@ -928,8 +1093,9 @@ struct FileRow: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            // 文件名：折两行显示，不截断。列宽靠右侧固定列自然得出，
-            // 只有**文本**自己 clipped（绝不能裁整个 cell：那会把文件类型图标一起挤没，
+            // 文件名：折两行显示，不截断。右侧五列（旋转/范围/份数/状态/删除）
+            // 固定收窄，把宽度还给文件名；只有**文本**自己 clipped
+            // （绝不能裁整个 cell：那会把文件类型图标一起挤没，
             // 实测 photo 符号会整片消失）。
             HStack(alignment: .top, spacing: 7) {
                 Image(systemName: item.isImage ? "photo" : (item.isOffice ? "doc.text" : "doc.richtext"))
@@ -1003,6 +1169,24 @@ struct FileRow: View {
             .padding(.trailing, 8)
             .frame(width: RowMetrics.rangeSlot, alignment: .trailing)
 
+            // 旋转（v1.2 体感回归）：↺ 角度 ↻ 两个方向钮都常驻，非 0 时角度变蓝。
+            // 未旋转时「—」是安静的灰色占位；点击角度归零。
+            HStack(spacing: 0) {
+                RailButton(sys: "rotate.left", tip: "逆时针旋转 90°") { rotate(-90) }
+                    .frame(width: 18)
+                Text(item.rotation == 0 ? "—" : "\(item.rotation)°")
+                    .font(.system(size: 10.5).monospacedDigit())
+                    .foregroundStyle(item.rotation == 0 ? Color.secondary : Color.accentColor)
+                    .frame(width: 22)
+                    .contentShape(Rectangle())
+                    .onTapGesture { if item.rotation != 0 { rotate(-item.rotation) } }
+                    .help(item.rotation == 0 ? "未旋转" : "当前 \(item.rotation)°，点击归零")
+                RailButton(sys: "rotate.right", tip: "顺时针旋转 90°") { rotate(90) }
+                    .frame(width: 18)
+            }
+            .frame(width: RowMetrics.rotateSlot, alignment: .center)
+            .animation(Motion.out, value: item.rotation)
+
             // 份数：保持 v1.2 的「直接可点」步进器，只是收窄到 56pt，值偏离 1 才变蓝
             HStack(spacing: 0) {
                 RailButton(sys: "minus", tip: "减少一份", off: item.copies <= 1) { bump(-1) }
@@ -1015,55 +1199,28 @@ struct FileRow: View {
             .padding(.trailing, 6)
             .frame(width: RowMetrics.copiesSlot, alignment: .trailing)
 
-            // 行尾效用位（固定宽度、左对齐）：
-            // 旋转就是**一个按钮**：点一下 +90°，0→90→180→270→0 循环，可以一直点。
-            // 未旋转时是一个安静的 ↻，转过之后变成蓝色的「↻90°」——
-            // 状态和入口是同一个东西，既不用 hover 才出来，也不抽动布局。
-            // （逆时针 ↺ 放在行右键菜单和预览头部：那两处有地方写标签。）
-            HStack(spacing: 4) {
+            // 状态：固定槽位，徽章完整显示；就绪时不占视觉（安静）
+            Group {
                 if item.status != .ready {
                     StatusBadge(status: item.status)
                 } else {
-                    Button {
-                        // ⌥ 点击 = 逆时针 90°。任何宽度成本都不花，却把「反悔」
-                        // （270° 想回 90°）从两下变一下；不写进 UI，只写在 tooltip 里。
-                        let ccw = NSEvent.modifierFlags.contains(.option)
-                        rotate(ccw ? -90 : 90)
-                    } label: {
-                        Group {
-                            if item.rotation == 0 {
-                                Image(systemName: "arrow.clockwise")
-                                    .font(.system(size: 11))
-                            } else {
-                                Text("↻\(item.rotation)°")
-                                    .font(.system(size: 10.5, weight: .medium).monospacedDigit())
-                                    .contentTransition(.numericText())
-                            }
-                        }
-                        .frame(minWidth: 20, minHeight: 22)
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(item.rotation == 0 ? Color.secondary : Color.accentColor)
-                    .opacity(item.rotation == 0 && !hl ? 0.6 : 1)
-                    .contentShape(Rectangle())
-                    .animation(Motion.out, value: item.rotation)
-                    .help(item.rotation == 0
-                          ? "点击顺时针旋转 90°（⌥ 点击逆时针）"
-                          : "当前 \(item.rotation)°，点击继续顺时针 90°（⌥ 点击逆时针）")
-                    if hl {
-                        RailButton(sys: "xmark.circle", tip: "从队列移除") {
-                            withAnimation(motion(reduce)) { model.remove(item) }
-                        }
-                        .transition(.opacity)
-                    }
+                    Color.clear.frame(width: 1, height: 1)
                 }
             }
-            .frame(width: RowMetrics.utilSlot, alignment: .leading)
-            // ⊗ 淡入而不是硬弹出（hover 类变化：快、微）
+            .frame(width: RowMetrics.statusSlot, alignment: .leading)
+
+            // 删除：hover 才出现（换取文件名宽度），固定槽位不抽动布局
+            ZStack {
+                Color.clear
+                if hl {
+                    RailButton(sys: "xmark.circle", tip: "从队列移除") {
+                        withAnimation(motion(reduce)) { model.remove(item) }
+                    }
+                    .transition(.opacity)
+                }
+            }
+            .frame(width: RowMetrics.delSlot, alignment: .center)
             .animation(.easeOut(duration: 0.12), value: hl)
-            // 效用位左对齐：让淡 ↻ / 箭头 / ⊗ 始终贴着份数那一列，
-            // 不然孔位太宽时会变成一片空白。右端固定宽度保证状态切换不抽动布局。
-            .frame(width: 62, alignment: .leading)
         }
         .padding(.horizontal, 14)
         .frame(minHeight: 44)
@@ -1190,9 +1347,49 @@ func shortPrinter(_ s: String) -> String {
     s.replacingOccurrences(of: "__", with: " ").replacingOccurrences(of: "_", with: " ")
 }
 
+/// 打印机可达性状态行：检测中(灰 spinner) / 可达(小绿点) / 未发现(橙点 + 重新检测)。
+/// 不用红色——红色留给「任务无法提交 / 文件错误」，这里是「允许继续的警告」。
+struct ReachRow: View {
+    @ObservedObject var model: Model
+
+    var body: some View {
+        HStack(spacing: 6) {
+            switch model.reach {
+            case .checking:
+                ProgressView().controlSize(.mini)
+            case .ok:
+                Circle().fill(Color(red: 0.13, green: 0.55, blue: 0.32)).frame(width: 6, height: 6)
+            case .unreachable:
+                Circle().fill(Color(red: 0.85, green: 0.53, blue: 0.08)).frame(width: 6, height: 6)
+            case .unknown:
+                Circle().fill(Color.primary.opacity(0.2)).frame(width: 6, height: 6)
+            }
+            Text(model.reach.label)
+                .font(.system(size: 11))
+                .foregroundStyle(model.reach == .unreachable ? Color.primary.opacity(0.75) : .secondary)
+                .lineLimit(1)
+            if model.reach == .unreachable {
+                Button("重新检测") { model.checkReach() }
+                    .buttonStyle(.link)
+                    .font(.system(size: 11))
+                    .controlSize(.small)
+                    // 默认不蓝：一行里「橙色状态 + 系统蓝 action」会把视线引到蓝字上。
+                    // 弱化到 secondary，hover 再蓝（.link 自带 hover 变化）。
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+        }
+        .frame(height: 18, alignment: .center)
+        .opacity(model.reach == .unknown ? 0 : 1)
+        .animation(.easeOut(duration: 0.25), value: model.reach)
+        .help("仍可发送打印任务。任务会保留在系统打印队列中，打印机重新可达后继续打印。")
+    }
+}
+
 // ── 打印设置 ────────────────────────────────────────────
 struct SettingsPanel: View {
     @ObservedObject var model: Model
+    @State private var savedFlash = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1207,9 +1404,29 @@ struct SettingsPanel: View {
                         .labelsHidden()
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .help(model.printer.isEmpty ? "没有检测到打印机" : model.printer)
+                        // 网络可达性状态行：正常时几乎不可见，异常时才解释发生了什么。
+                        // 固定预留高度，不因状态变化把下面的「页面缩放」顶来顶去。
+                        ReachRow(model: model)
                     }
                     group("页面缩放") {
                         VStack(alignment: .leading, spacing: 2) {
+                            HStack {
+                                Spacer()
+                                Button(savedFlash ? "已设为默认" : "存为默认") { model.saveDefaultScale() }
+                                    .buttonStyle(.link)
+                                    .font(.system(size: 11))
+                                    .controlSize(.small)
+                                    // 对比度对齐其他 secondary 文字（太浅会被误读成 disabled）；
+                                    // 保存后按钮自己说「已设为默认」1 秒——比只靠底栏 flash 更直接
+                                    .foregroundStyle(savedFlash ? Color(red: 0.13, green: 0.55, blue: 0.32) : Color.primary.opacity(0.72))
+                                    .animation(.easeOut(duration: 0.2), value: savedFlash)
+                                    .help("把当前缩放模式与比例存为启动默认值（当前启动默认：\(model.mode.rawValue)\(model.mode == .custom ? " \(Int(model.percent))%" : "")）")
+                                    .onTapGesture {
+                                        savedFlash = true
+                                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { savedFlash = false }
+                                    }
+                            }
+                            .frame(height: 14)
                             ForEach(ScaleMode.allCases) { m in
                                 RadioRow(title: m.rawValue, selected: model.mode == m) {
                                     withAnimation(motion(false)) { model.mode = m }
@@ -1436,6 +1653,16 @@ struct PreviewPane: View {
 // ── 底栏 ────────────────────────────────────────────────
 struct BottomBar: View {
     @ObservedObject var model: Model
+    @State private var askReprint = false
+
+    /// 这批文件是否刚全部发送过（没改过任何东西）→ 再点打印是「重打」，先确认
+    private var isReprint: Bool {
+        !model.items.isEmpty && model.items.allSatisfy { $0.status == .sent }
+    }
+
+    private func askReprintIfNeeded() {
+        if isReprint { askReprint = true } else { model.doPrint() }
+    }
 
     /// 版本号从 Info.plist 读，避免「装了新版，界面上看不出来」
     private var version: String {
@@ -1473,7 +1700,7 @@ struct BottomBar: View {
             HoverButton(kind: .cta,
                         tip: model.items.isEmpty ? "先添加 PDF 文件"
                              : (model.printer.isEmpty ? "未检测到打印机" : "⌘P"), off: model.items.isEmpty || model.printer.isEmpty || model.busy) {
-                model.doPrint()
+                askReprintIfNeeded()
             } label: {
                 HStack(spacing: 6) {
                     if model.busy { ProgressView().controlSize(.small) }
@@ -1481,6 +1708,12 @@ struct BottomBar: View {
                 }
             }
             .keyboardShortcut("p", modifiers: .command)
+            .alert("再次打印这批文件？", isPresented: $askReprint) {
+                Button("取消", role: .cancel) {}
+                Button("再打印一次") { model.doPrint() }
+            } message: {
+                Text("这批文件已经提交过。继续将按当前设置再次提交全部文件，可能产生重复打印。")
+            }
         }
         .padding(.horizontal, 16)
         .frame(height: 48)
@@ -1489,6 +1722,14 @@ struct BottomBar: View {
             Rectangle().fill(Color.primary.opacity(0.07)).frame(height: 1)
         }
         .animation(.easeOut(duration: 0.18), value: model.message)
+        // 快照钩子：配合 sample items + 全部标记已发送，自动弹「重打确认」验证弹窗样式
+        .onAppear {
+            if ProcessInfo.processInfo.environment["BATCHPRINT_REPRINT"] == "1",
+               !model.items.isEmpty {
+                for i in model.items.indices { model.items[i].status = .sent }
+                askReprint = true
+            }
+        }
     }
 }
 
