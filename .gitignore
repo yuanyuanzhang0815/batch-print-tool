@@ -1,4 +1,8 @@
+# 构建产物与打包中间态（app 走 GitHub Release 分发，不进仓库）
 build/
+dist/
+
+# 系统垃圾
 .DS_Store
 *.dSYM
 *.swift.bak.part

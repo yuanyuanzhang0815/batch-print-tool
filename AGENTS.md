@@ -16,7 +16,7 @@ macOS 原生批量打印小工具（SwiftUI，单文件实现）。把一堆文�
 
 - **本仓库既是开发仓库也是发布仓库**。曾经分成「私有开发仓库 print-tools + 公开发布快照 macos-batch-print」，2026-09-24 合并为一个，原因：两边 `src/App.swift` 完全相同，维护两份必然漂移
 - 仓库名是 `batch-print-tool`，但 app 名和 bundle 名是 `批量打印工具` / `BatchPrint`，产物路径 `dist/批量打印工具.app`
-- `dist/` 里的 app 是**提交进仓库**的（.gitignore 只忽略 `build/`），Release 附件另存 DMG/ZIP
+- `dist/` **不进仓库**（.gitignore 里忽略）——app 只通过 GitHub Release 的 DMG/ZIP 分发。历史里有旧二进制（移除前的 commit），但那不影响以后
 - 只测 Apple Silicon + macOS 26；未公证，首次打开需手动放行
 - Git 推送：本机全局 git 把 github 代理设成空值（走直连，会 75s 超时）。本仓库已设 repo-local `http.https://github.com/.proxy = http://127.0.0.1:7890`，直接 `git push` 即可
 
@@ -33,7 +33,6 @@ macOS 原生批量打印小工具（SwiftUI，单文件实现）。把一堆文�
 - `README.zh-CN.md` → 中文（含实现要点 / 视觉语言 / 无头自检等开发文档）
 - `screenshots/01-06*.png` → README 与 Release 用的真机快照
 - `design/queue-redesign-v1~v3.html` → 队列布局迭代过程的三版 HTML 原型（仅历史参考）
-- `dist/批量打印工具.app` → 打包产物（已提交）
 - `tools/scalepdf.swift` → 早期独立 CLI 原型
 - `legacy/AppKit-v1.swift.bak` → 最早的 AppKit 版本，仅参考
 - `assets/AppIcon.icns` → 应用图标
@@ -41,4 +40,7 @@ macOS 原生批量打印小工具（SwiftUI，单文件实现）。把一堆文�
 ## 待办
 
 - [ ] 每次发版：改 `VERSION`（`build.sh` 会同步 plist）→ `./build.sh --package` → 提交 → 打 tag → 建 Release 上传 DMG/ZIP
-- [ ] 考虑把 `dist/` 从仓库里移出（只留 Release 附件），减小仓库体积
+
+## 已完成
+
+- [x] `dist/` 移出仓库（.gitignore 忽略），app 只走 Release 分发
