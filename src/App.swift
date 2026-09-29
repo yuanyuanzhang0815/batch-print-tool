@@ -470,6 +470,8 @@ final class Model: ObservableObject {
     @Published var message = ""
     @Published var busy = false
     @Published var reach: ReachState = .unknown
+    /// 加过 Office/文本文件但本机没有 LibreOffice：提示一次 + 引导安装
+    @Published var missingLibreOffice = false
     /// 已保存的启动默认缩放（「设为默认」存进来的）；nil = 从未存过
     @Published var savedScaleMode: ScaleMode?
     @Published var savedScalePercent: Double = 80
@@ -489,6 +491,8 @@ final class Model: ObservableObject {
             savedScalePercent = p
             percent = p
         }
+        // 快照钩子：预置 LibreOffice 缺失态，验证底栏引导链接
+        if ProcessInfo.processInfo.environment["BATCHPRINT_NO_SOFFICE"] == "1" { missingLibreOffice = true }
         let r = listPrinters()
         printers = r.names
         printer = r.def ?? r.names.first ?? ""
@@ -564,9 +568,16 @@ final class Model: ObservableObject {
     }
 
     func add(_ urls: [URL]) {
-        let needConvert = urls.contains { isOfficeFile($0) }
-        if needConvert { busy = true; message = "正在用 LibreOffice 转换文档…" }
-        defer { if needConvert { busy = false } }
+        // Office/文本需要 LibreOffice：在加入的瞬间就检测，缺了直接告诉用户怎么办，
+        // 而不是等到渲染时静默跳过（用户只会看到「文件打不出来」却不知道原因）。
+        let hasOffice = urls.contains { isOfficeFile($0) }
+        if hasOffice, sofficePath() == nil {
+            flash("缺少 LibreOffice：Office/文本文件无法转换。brew install --cask libreoffice 或官网下载", seconds: 8)
+            missingLibreOffice = true
+        }
+        let needConvert = hasOffice
+        if needConvert, sofficePath() != nil { busy = true; message = "正在用 LibreOffice 转换文档…" }
+        defer { if needConvert, sofficePath() != nil { busy = false } }
         var added: [PrintItem] = []
         for u in urls {
             var isDir: ObjCBool = false
@@ -1971,6 +1982,16 @@ struct BottomBar: View {
                     Label("取消剩余", systemImage: "stop.fill")
                 }
             } else {
+                if model.missingLibreOffice {
+                    Button("安装 LibreOffice…") {
+                        NSWorkspace.shared.open(URL(string: "https://www.libreoffice.org/download/download-libreoffice/")!)
+                    }
+                    .buttonStyle(.link)
+                    .font(.system(size: 11))
+                    .controlSize(.small)
+                    .foregroundStyle(Color.primary.opacity(0.72))
+                    .help("Office/文本文件需要 LibreOffice 转换。也可 brew install --cask libreoffice")
+                }
                 if hasSent {
                     HoverButton(tip: "从列表移除已发送的文件（失败/已取消保留）") {
                         model.clearSent()
