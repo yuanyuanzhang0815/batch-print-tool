@@ -460,16 +460,24 @@ final class Model: ObservableObject {
     @Published var message = ""
     @Published var busy = false
     @Published var reach: ReachState = .unknown
+    /// 已保存的启动默认缩放（「设为默认」存进来的）；nil = 从未存过
+    @Published var savedScaleMode: ScaleMode?
+    @Published var savedScalePercent: Double = 80
     private var printerURIs: [String: String] = [:]
     private var reachTask: Task<Void, Never>?
     private var flashToken = 0
 
     init() {
-        // 全局默认缩放：用户「存为默认」过的模式+比例优先于出厂值（custom 80%）
+        // 全局默认缩放：用户「设为默认」过的模式+比例优先于出厂值（custom 80%）
         let ud = UserDefaults.standard
-        if let m = ud.string(forKey: "bp.defaultScaleMode"), let saved = ScaleMode(rawValue: m) { mode = saved }
+        if let m = ud.string(forKey: "bp.defaultScaleMode"), let saved = ScaleMode(rawValue: m) {
+            savedScaleMode = saved
+            mode = saved
+        }
         if ud.object(forKey: "bp.defaultScalePercent") != nil {
-            percent = min(100, max(50, ud.double(forKey: "bp.defaultScalePercent")))
+            let p = min(100, max(50, ud.double(forKey: "bp.defaultScalePercent")))
+            savedScalePercent = p
+            percent = p
         }
         let r = listPrinters()
         printers = r.names
@@ -484,6 +492,11 @@ final class Model: ObservableObject {
         // 快照 / 演示用：强制指定可达性状态（ok/unreachable/checking），
         // 否则真实探测 2-3s，截图时机不可控。
         let reachOverride = ProcessInfo.processInfo.environment["BATCHPRINT_REACH"]
+        // 快照钩子：预置「已保存的默认缩放」，验证「默认」标记态
+        if ProcessInfo.processInfo.environment["BATCHPRINT_SAVED_DEFAULT"] == "1" {
+            savedScaleMode = mode
+            savedScalePercent = percent
+        }
         if reachOverride == "ok" { reach = .ok }
         else if reachOverride == "unreachable" { reach = .unreachable }
         else if reachOverride == "checking" { reach = .checking }
@@ -514,12 +527,20 @@ final class Model: ObservableObject {
         items.reduce(0) { $0 + parseRange($1.range, total: $1.pages).count * max(1, $1.copies) }
     }
 
-    /// 把当前缩放模式+比例存为启动默认值（持久化）
-    func saveDefaultScale() {
+    /// 当前缩放（模式+比例）是否就是已保存的启动默认
+    var isCurrentScaleDefault: Bool {
+        guard let saved = savedScaleMode else { return false }
+        if saved != mode { return false }
+        return mode == .custom ? savedScalePercent == percent : true
+    }
+
+    /// 把当前缩放模式+比例设为启动默认值（持久化）；状态标记的变化本身就是反馈
+    func setDefaultScale() {
+        savedScaleMode = mode
+        savedScalePercent = percent
         let ud = UserDefaults.standard
         ud.set(mode.rawValue, forKey: "bp.defaultScaleMode")
         ud.set(percent, forKey: "bp.defaultScalePercent")
-        flash("已存为默认缩放：\(mode.rawValue)\(mode == .custom ? " \(Int(percent))%" : "")")
     }
 
     func flash(_ s: String, seconds: Double = 2.4) {
@@ -1389,7 +1410,6 @@ struct ReachRow: View {
 // ── 打印设置 ────────────────────────────────────────────
 struct SettingsPanel: View {
     @ObservedObject var model: Model
-    @State private var savedFlash = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1410,27 +1430,16 @@ struct SettingsPanel: View {
                     }
                     group("页面缩放") {
                         VStack(alignment: .leading, spacing: 2) {
-                            HStack {
-                                Spacer()
-                                Button(savedFlash ? "已设为默认" : "存为默认") { model.saveDefaultScale() }
-                                    .buttonStyle(.link)
-                                    .font(.system(size: 11))
-                                    .controlSize(.small)
-                                    // 对比度对齐其他 secondary 文字（太浅会被误读成 disabled）；
-                                    // 保存后按钮自己说「已设为默认」1 秒——比只靠底栏 flash 更直接
-                                    .foregroundStyle(savedFlash ? Color(red: 0.13, green: 0.55, blue: 0.32) : Color.primary.opacity(0.72))
-                                    .animation(.easeOut(duration: 0.2), value: savedFlash)
-                                    .help("把当前缩放模式与比例存为启动默认值（当前启动默认：\(model.mode.rawValue)\(model.mode == .custom ? " \(Int(model.percent))%" : "")）")
-                                    .onTapGesture {
-                                        savedFlash = true
-                                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { savedFlash = false }
-                                    }
-                            }
-                            .frame(height: 14)
                             ForEach(ScaleMode.allCases) { m in
-                                RadioRow(title: m.rawValue, selected: model.mode == m) {
-                                    withAnimation(motion(false)) { model.mode = m }
-                                }
+                                RadioRow(
+                                    title: m.rawValue,
+                                    selected: model.mode == m,
+                                    action: { withAnimation(motion(false)) { model.mode = m } },
+                                    // fit/actual：模式本身就是「值」，行尾元素直接挂在选中行；
+                                    // custom 的行尾元素挂在下面滑块行的 80% 旁边
+                                    trailing: m == .custom ? nil
+                                        : (m == model.mode ? AnyView(ScaleDefaultTrailing(model: model)) : nil)
+                                )
                             }
                             if model.mode == .custom {
                                 HStack(spacing: 10) {
@@ -1438,9 +1447,12 @@ struct SettingsPanel: View {
                                     Text("\(Int(model.percent))%")
                                         .font(.system(size: 12).monospacedDigit())
                                         .frame(width: 44, alignment: .trailing)
+                                    // custom：值是百分比，「设为默认/默认」贴在 80% 旁边
+                                    ScaleDefaultTrailing(model: model)
                                 }
                                 .padding(.top, 6)
                                 .transition(.opacity.combined(with: .move(edge: .top)))
+                                .animation(.easeOut(duration: 0.2), value: model.isCurrentScaleDefault)
                             }
                         }
                     }
@@ -1492,6 +1504,7 @@ struct RadioRow: View {
     let title: String
     let selected: Bool
     let action: () -> Void
+    var trailing: AnyView? = nil
     @State private var hover = false
 
     var body: some View {
@@ -1504,6 +1517,7 @@ struct RadioRow: View {
             .frame(width: 15, height: 15)
             Text(title).font(.system(size: 12.5))
             Spacer()
+            if let trailing { trailing }
         }
         .padding(.vertical, 3)
         .padding(.horizontal, 6)
@@ -1511,6 +1525,32 @@ struct RadioRow: View {
         .contentShape(Rectangle())
         .onHover { h in withAnimation(.easeOut(duration: 0.12)) { hover = h } }
         .onTapGesture(perform: action)
+    }
+}
+
+// ── 缩放默认行尾元素 ─────────────────────────────────────
+/// 缩放「设为默认」的行尾元素：和当前值绑定，而不是挂在组标题上。
+/// 已是默认 → 弱标记「默认」（静态、很淡）；不是 → 「设为默认」链接。
+/// 拖动滑块时标记↔链接的切换就是「当前值 ≠ 默认值」的状态自白。
+struct ScaleDefaultTrailing: View {
+    @ObservedObject var model: Model
+
+    var body: some View {
+        if model.isCurrentScaleDefault {
+            Text("默认")
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+                .help("当前缩放已设为启动默认")
+                .transition(.opacity)
+        } else {
+            Button("设为默认") { model.setDefaultScale() }
+                .buttonStyle(.link)
+                .font(.system(size: 11))
+                .controlSize(.small)
+                .foregroundStyle(Color.primary.opacity(0.72))
+                .help("把当前缩放设为启动默认（以后打开 app 即用这套缩放）")
+                .transition(.opacity)
+        }
     }
 }
 
