@@ -387,7 +387,15 @@ func renderPage(url: URL, mode: ScaleMode, percent: Double, sourcePage: Int,
 
 // ── 模型 ────────────────────────────────────────────────
 enum ItemStatus: String {
-    case ready = "就绪", sent = "已发送", failed = "失败"
+    case ready = "就绪"
+    /// pending/processing 在 UI 上收敛成一个「队列中」：CUPS 的 processing
+    /// 不等于出纸，展示「打印中」是伪实时，用户只关心来不来得及取消
+    case queued = "队列中", sent = "已发送", canceled = "已取消", failed = "失败"
+
+    /// 终态：不再轮询、可以重打/移除
+    var isSettled: Bool { self == .sent || self == .canceled || self == .failed }
+    /// job 还在系统队列里（可取消）
+    var isLive: Bool { self == .queued }
 }
 
 struct PrintItem: Identifiable {
@@ -398,6 +406,8 @@ struct PrintItem: Identifiable {
     var copies = 1
     var rotation = 0          // 0 / 90 / 180 / 270，顺时针为正，逐文件独立
     var status: ItemStatus = .ready
+    /// 1 batch → N file jobs：每个文件提交后拿到的 CUPS job id（printer-N）
+    var jobID: String? = nil
     var name: String { url.lastPathComponent }
     var isImage: Bool { isImageFile(url) }
     var isOffice: Bool { isOfficeFile(url) }
@@ -593,8 +603,11 @@ final class Model: ObservableObject {
 
     func clear() {
         guard !items.isEmpty else { return }
+        // 还有 job 在系统队列里：不能删了行却让 job 继续在后台打——先取消再清
+        if !liveRows.isEmpty { cancelOutstanding() }
         items.removeAll()
         current = 0
+        stopPolling()
         flash("已清空文件队列")
     }
 
@@ -635,37 +648,173 @@ final class Model: ObservableObject {
         }
     }
 
+    // 逐文件 job 轮询：只在有未落定 job 时跳（每 2s），全部落定即停；不常驻监控
+    private var pollTimer: Timer?
+
+    private var liveRows: [Int] {
+        items.indices.filter { items[$0].status.isLive }
+    }
+
+    private func startPollingIfNeeded() {
+        guard pollTimer == nil, !liveRows.isEmpty else { return }
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.refreshJobStates() }
+        }
+    }
+
+    private func stopPolling() {
+        pollTimer?.invalidate(); pollTimer = nil
+    }
+
+    /// 从 lpstat 拉一次所有 job 状态，同步到行。
+    /// 逐文件 lp 时拿到的是「printer-N」request id；完成态查 completed 列表。
+    func refreshJobStates() {
+        let live = items.filter { $0.status.isLive }
+        guard !live.isEmpty else { stopPolling(); return }
+        let q = printer
+        // 未完成："printer-N user size date"；完成：同格式
+        let pending = Set(runCmd("/usr/bin/lpstat", ["-o", q]).split(separator: "\n")
+            .compactMap { line -> String? in
+                guard let r = line.range(of: "\\S+-\\d+", options: .regularExpression) else { return nil }
+                return String(line[r])
+            })
+        let completed = Set(runCmd("/usr/bin/lpstat", ["-W", "completed", "-o", q]).split(separator: "\n")
+            .compactMap { line -> String? in
+                guard let r = line.range(of: "\\S+-\\d+", options: .regularExpression) else { return nil }
+                return String(line[r])
+            })
+        var changed = false
+        for i in items.indices where items[i].status.isLive {
+            guard let jid = items[i].jobID else { continue }
+            if completed.contains(jid) {
+                items[i].status = .sent; changed = true
+            } else if !pending.contains(jid) {
+                // 既不在未完成也不在已完成：被取消或出错。区分不了就标已取消（用户主动取消的多数场景）
+                items[i].status = .canceled; changed = true
+            }
+        }
+        if liveRows.isEmpty { stopPolling() }
+    }
+
+    /// 取消单个文件的打印任务（×/stop 的已提交分支）
+    func cancelJob(_ item: PrintItem) {
+        guard let jid = item.jobID, item.status.isLive else { return }
+        _ = runCmd("/usr/bin/cancel", [jid])
+        if let i = items.firstIndex(where: { $0.id == item.id }) {
+            items[i].status = .canceled
+        }
+        flash("已取消打印任务：\(item.name)")
+        if liveRows.isEmpty { stopPolling() }
+    }
+
+    /// 取消剩余：一次取消本 app 提交的所有未完成 job
+    func cancelOutstanding() {
+        let live = items.filter { $0.status.isLive }
+        guard !live.isEmpty else { return }
+        for it in live {
+            _ = runCmd("/usr/bin/cancel", [it.jobID].compactMap { $0 })
+            if let i = items.firstIndex(where: { $0.id == it.id }) {
+                items[i].status = .canceled
+            }
+        }
+        stopPolling()
+        flash("已取消 \(live.count) 个打印任务")
+    }
+
+    /// 清除已发送（不含失败/已取消——失败值得用户看到和处理）
+    func clearSent() {
+        let keep = items.filter { $0.status != .sent }
+        guard keep.count < items.count else { return }
+        let removed = items.count - keep.count
+        items = keep
+        current = min(current, max(0, items.count - 1))
+        flash("已清除 \(removed) 个已发送文件")
+    }
+
+    /// 单文件重打：仅终态行（右键菜单）；不弹确认，量小风险小
+    func reprintItem(_ item: PrintItem) {
+        guard item.status.isSettled, !printer.isEmpty else { return }
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("bp-\(UUID().uuidString)")
+        let plan = BatchPlan(items: [BatchPlan.Item(url: item.url, pages: parseRange(item.range, total: item.pages),
+                                                    copies: item.copies, rotation: item.rotation)],
+                             mode: mode, percent: percent, paper: paper, margin: margin)
+        busy = true
+        Task { @MainActor in
+            let outs = await renderOffMain { scaledAllIndexed(plan, to: tmp) }
+            self.busy = false
+            guard let first = outs.first, !first.files.isEmpty else {
+                self.flash("重新打印失败：\(item.name)", seconds: 5)
+                return
+            }
+            var args = ["-d", self.printer]
+            if self.duplex { args += ["-o", "sides=two-sided-long-edge"] }
+            else { args += ["-o", "sides=one-sided"] }
+            args += first.files.map { $0.path }
+            let out = runCmd("/usr/bin/lp", args)
+            let jid = Self.parseJobID(out)
+            if let i = self.items.firstIndex(where: { $0.id == item.id }) {
+                self.items[i].status = jid != nil ? .queued : .failed
+                self.items[i].jobID = jid
+            }
+            if jid != nil {
+                self.startPollingIfNeeded()
+                self.flash("已重新打印：\(item.name)")
+            } else {
+                self.flash("重新打印失败：\(out.prefix(80))", seconds: 6)
+            }
+        }
+    }
+
+    /// lp 输出里抽取 request id。
+    /// 英文："request id is printer-123"；中文："请求id是printer-123（1个文件）"。
+    /// 不能裸抓 \S+-\d+（中文前缀「请求id是」会被一起吞进去，跟 lpstat 的裸 id 对不上）
+    static func parseJobID(_ out: String) -> String? {
+        // 取「是/is」后面的那一段再抓 id
+        let tail: Substring
+        if let r = out.range(of: "id是") { tail = out[r.upperBound...] }            // 中文 locale：请求id是
+        else if let r = out.range(of: "request id is") { tail = out[r.upperBound...] }   // 英文 locale
+        else { tail = out[...] }
+        guard let r = tail.range(of: #"[A-Za-z0-9_]+-\d+"#, options: .regularExpression) else { return nil }
+        return String(tail[r])
+    }
+
     func doPrint() {
         guard !items.isEmpty else { return }
         guard !printer.isEmpty else { flash("没找到打印机"); return }
         busy = true
         let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("bp-\(UUID().uuidString)")
-        renderBatchAsync(tmp) { outs in
+        let plan = batchPlan()
+        Task { @MainActor in
+            let outs = await renderOffMain { scaledAllIndexed(plan, to: tmp) }
+            self.busy = false
             guard !outs.isEmpty else {
-                self.busy = false
                 self.flash("生成失败，检查 PDF 是否损坏", seconds: 6)
                 return
             }
-            var args = ["-d", self.printer, "-o", "Collate=\(outs.count > 1 ? "True" : "False")"]
-            if self.duplex { args += ["-o", "sides=two-sided-long-edge"] }
-            else { args += ["-o", "sides=one-sided"] }
-            args += outs.map { $0.path }
-            let out = runCmd("/usr/bin/lp", args)
-            self.busy = false
-            let ok = out.lowercased().contains("request id") || out.contains("请求id")
-                || out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            if ok {
-                for i in self.items.indices { self.items[i].status = .sent }
-                let base = "已发送到 \(shortPrinter(self.printer))：\(outs.count) 个文件 / \(self.totalSheets) 页"
-                // 打印机不在当前网络：lp 仍会提交成功，CUPS 静默排队。是提示不是拦截。
-                if self.reach == .unreachable {
-                    self.flash("\(base)。打印机不在当前网络：任务已加入队列，连上后自动打印", seconds: 6)
-                } else {
-                    self.flash(base)
+            // 1 batch → N file jobs：逐文件 lp，各自拿到独立 request id。
+            // 单个文件失败不拖死整批；行级状态/取消/重打都建立在 job id 上。
+            var okCount = 0, failCount = 0
+            for (row, files) in outs {
+                var args = ["-d", self.printer]
+                if self.duplex { args += ["-o", "sides=two-sided-long-edge"] }
+                else { args += ["-o", "sides=one-sided"] }
+                args += files.map { $0.path }
+                let out = runCmd("/usr/bin/lp", args)
+                let jid = Self.parseJobID(out)
+                if self.items.indices.contains(row) {
+                    self.items[row].status = jid != nil ? .queued : .failed
+                    self.items[row].jobID = jid
                 }
+                if jid != nil { okCount += 1 } else { failCount += 1 }
+            }
+            self.startPollingIfNeeded()
+            let base = "已发送到 \(shortPrinter(self.printer))：\(okCount) 个文件 / \(self.totalSheets) 页"
+                + (failCount > 0 ? "，\(failCount) 个失败" : "")
+            // 打印机不在当前网络：lp 仍会提交成功，CUPS 静默排队。是提示不是拦截。
+            if self.reach == .unreachable {
+                self.flash("\(base)。打印机不在当前网络：任务已加入队列，连上后自动打印", seconds: 6)
             } else {
-                for i in self.items.indices { self.items[i].status = .failed }
-                self.flash("打印失败：\(out.prefix(90))", seconds: 8)
+                self.flash(base)
             }
         }
     }
@@ -886,6 +1035,25 @@ func scaledAll(_ plan: BatchPlan, to dir: URL) -> [URL] {
     return outs
 }
 
+/// 逐文件渲染，带队列行索引：1 batch → N file jobs 的提交基础。
+/// 渲染失败的行返回 nil（不拖死整批，失败隔离到行级）。
+func scaledAllIndexed(_ plan: BatchPlan, to dir: URL) -> [(row: Int, files: [URL])] {
+    var outs: [(Int, [URL])] = []
+    for (i, it) in plan.items.enumerated() {
+        var files: [URL] = []
+        for copy in 0..<max(1, it.copies) {
+            let suffix = it.copies > 1 ? "-c\(copy + 1)" : ""
+            if let o = scaledPDF(input: it.url, outDir: dir, mode: plan.mode, percent: plan.percent,
+                                 pages: it.pages, suffix: suffix, paper: plan.paper,
+                                 margin: plan.margin, rotation: it.rotation) {
+                files.append(o)
+            }
+        }
+        if !files.isEmpty { outs.append((i, files)) }
+    }
+    return outs
+}
+
 // ── 主界面：文件队列 34% ｜ 打印设置 23% ｜ 预览 43% ─────
 struct ContentView: View {
     var sampleDir: String? = nil
@@ -951,6 +1119,20 @@ struct ContentView: View {
                 model.items[0].rotation = 90
                 if model.items.count > 1 { model.items[1].rotation = 270 }
                 model.current = 0   // 让预览头部的「已转 90° · 复位」也能被快照盖到
+            }
+            // 快照钩子：预置 job 状态（queued/live、canceled、mixed 终态），验证 1→N job 的 UI。
+            // 放在 sample 加载后（Model.init 时 items 还是空的）
+            if let jobs = ProcessInfo.processInfo.environment["BATCHPRINT_JOBS"], !model.items.isEmpty {
+                let fake = "\(model.printer.isEmpty ? "printer" : model.printer)-999999"
+                for i in model.items.indices {
+                    switch jobs {
+                    case "queued": model.items[i].status = .queued; model.items[i].jobID = fake
+                    case "canceled": model.items[i].status = .canceled
+                    case "mixed": model.items[i].status = i % 3 == 0 ? .queued : (i % 3 == 1 ? .sent : .failed)
+                        if i % 3 == 0 { model.items[i].jobID = fake }
+                    default: break
+                    }
+                }
             }
             // 导出路径（走渲染队列的那条）也要能被无头验证：
             // NSOpenPanel 没法自动化，所以给一个直接指定输出目录的钩子
@@ -1230,10 +1412,18 @@ struct FileRow: View {
             }
             .frame(width: RowMetrics.statusSlot, alignment: .leading)
 
-            // 删除：hover 才出现（换取文件名宽度），固定槽位不抽动布局
+            // 删除位语义分流：
+            // · job 还在系统队列 → stop 图标 = 取消打印任务（行保留，徽章变已取消）
+            // · 未提交 / 已落定 → × = 从列表移除（原行为）
+            // 两个图标刻意区分，用户不该猜「删文件」还是「停打印」
             ZStack {
                 Color.clear
-                if hl {
+                if item.status.isLive {
+                    RailButton(sys: "stop.fill", tip: "取消此文件的打印任务",
+                               tint: Color(red: 0.85, green: 0.53, blue: 0.08)) {
+                        model.cancelJob(item)
+                    }
+                } else if hl {
                     RailButton(sys: "xmark.circle", tip: "从队列移除") {
                         withAnimation(motion(reduce)) { model.remove(item) }
                     }
@@ -1257,7 +1447,14 @@ struct FileRow: View {
             Divider()
             Button("设置页码范围…") { showRange = true }
             Button("在访达中显示") { NSWorkspace.shared.activateFileViewerSelecting([item.url]) }
+            // 仅终态行提供（队列中会和在跑的 job 重复出纸）
+            if item.status.isSettled {
+ Button("重新打印此文件") { model.reprintItem(item) }
+            }
             Divider()
+            if item.status.isLive {
+                Button("取消打印任务") { model.cancelJob(item) }
+            }
             Button("从队列移除") { withAnimation(motion(reduce)) { model.remove(item) } }
         }
         .contentShape(Rectangle())
@@ -1318,11 +1515,12 @@ struct RailButton: View {
     let sys: String
     let tip: String
     var off = false
+    var tint: Color? = nil
     let action: () -> Void
     @State private var hover = false
 
-    init(sys: String, tip: String, off: Bool = false, action: @escaping () -> Void) {
-        self.sys = sys; self.tip = tip; self.off = off; self.action = action
+    init(sys: String, tip: String, off: Bool = false, tint: Color? = nil, action: @escaping () -> Void) {
+        self.sys = sys; self.tip = tip; self.off = off; self.tint = tint; self.action = action
     }
 
     var body: some View {
@@ -1333,7 +1531,7 @@ struct RailButton: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .foregroundStyle(hover ? Color.primary : Color.secondary)
+        .foregroundStyle(tint ?? (hover ? Color.primary : Color.secondary))
         .background(RoundedRectangle(cornerRadius: 5)
             .fill(Color.primary.opacity(hover ? 0.10 : 0)))
         .opacity(off ? 0.35 : 1)
@@ -1353,11 +1551,13 @@ struct StatusBadge: View {
             .overlay(Capsule().strokeBorder(status == .ready ? Color.primary.opacity(0.18) : .clear,
                                             lineWidth: 1))
             .foregroundStyle(color)
-            .transition(.scale(scale: 0.95).combined(with: .opacity))
+            // 状态切换只做 opacity crossfade：无 scale/spring，避免监控 dashboard 感
+            .transition(.opacity)
     }
     private var color: Color {
         switch status {
         case .ready: return Color.primary.opacity(0.72)
+        case .queued, .canceled: return Color.primary.opacity(0.55)
         case .sent: return Color(red: 0.13, green: 0.55, blue: 0.32)
         case .failed: return Color(red: 0.8, green: 0.2, blue: 0.2)
         }
@@ -1709,11 +1909,28 @@ struct BottomBar: View {
         (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String) ?? "dev"
     }
 
+    /// 底栏生命周期：有 job 在跑 → 「取消剩余」接管主操作位；
+    /// 全部落定且有已发送 → 「清除已发送」作收尾。都不是 → 常规「导出/打印」。
+    private var liveCount: Int { model.items.filter { $0.status.isLive }.count }
+    private var hasSent: Bool { model.items.contains { $0.status == .sent } }
+
     var body: some View {
         HStack(spacing: 10) {
             Text("\(model.items.count) 个文件 · \(model.totalSheets) 页")
                 .font(.system(size: 12.5).monospacedDigit())
                 .foregroundStyle(.secondary)
+
+            if liveCount > 0 {
+                Text("· \(liveCount) 个任务队列中")
+                    .font(.system(size: 12))
+                    .foregroundStyle(Color(red: 0.85, green: 0.53, blue: 0.08))
+                    .transition(.opacity)
+            } else if hasSent, model.message.isEmpty {
+                Text("· 已全部发送")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                    .transition(.opacity)
+            }
 
             if !model.message.isEmpty {
                 Text("·").foregroundStyle(.tertiary)
@@ -1731,28 +1948,45 @@ struct BottomBar: View {
                 .help("批量打印工具版本")
             if model.busy { ProgressView().controlSize(.small) }
 
-            HoverButton(tip: "只生成缩放后的 PDF，不打印", off: model.items.isEmpty) {
-                model.doExport()
-            } label: {
-                Label("导出 PDF", systemImage: "square.and.arrow.down")
-            }
-
-            HoverButton(kind: .cta,
-                        tip: model.items.isEmpty ? "先添加 PDF 文件"
-                             : (model.printer.isEmpty ? "未检测到打印机" : "⌘P"), off: model.items.isEmpty || model.printer.isEmpty || model.busy) {
-                askReprintIfNeeded()
-            } label: {
-                HStack(spacing: 6) {
-                    if model.busy { ProgressView().controlSize(.small) }
-                    Text(model.busy ? "正在发送…" : "开始打印").frame(minWidth: 78)
+            if liveCount > 0 {
+                // 有 job 在跑：此时最重要的操作不是「继续」而是「如果需要，停止」。
+                // 不留 disabled 蓝钮占位——那是为对称而对称
+                HoverButton(tip: "取消本批所有未完成的打印任务") {
+                    model.cancelOutstanding()
+                } label: {
+                    Label("取消剩余", systemImage: "stop.fill")
                 }
-            }
-            .keyboardShortcut("p", modifiers: .command)
-            .alert("再次打印这批文件？", isPresented: $askReprint) {
-                Button("取消", role: .cancel) {}
-                Button("再打印一次") { model.doPrint() }
-            } message: {
-                Text("这批文件已经提交过。继续将按当前设置再次提交全部文件，可能产生重复打印。")
+            } else {
+                if hasSent {
+                    HoverButton(tip: "从列表移除已发送的文件（失败/已取消保留）") {
+                        model.clearSent()
+                    } label: {
+                        Label("清除已发送", systemImage: "checkmark.circle")
+                    }
+                }
+                HoverButton(tip: "只生成缩放后的 PDF，不打印", off: model.items.isEmpty) {
+                    model.doExport()
+                } label: {
+                    Label("导出 PDF", systemImage: "square.and.arrow.down")
+                }
+
+                HoverButton(kind: .cta,
+                            tip: model.items.isEmpty ? "先添加 PDF 文件"
+                                 : (model.printer.isEmpty ? "未检测到打印机" : "⌘P"), off: model.items.isEmpty || model.printer.isEmpty || model.busy) {
+                    askReprintIfNeeded()
+                } label: {
+                    HStack(spacing: 6) {
+                        if model.busy { ProgressView().controlSize(.small) }
+                        Text(model.busy ? "正在发送…" : "开始打印").frame(minWidth: 78)
+                    }
+                }
+                .keyboardShortcut("p", modifiers: .command)
+                .alert("再次打印这批文件？", isPresented: $askReprint) {
+                    Button("取消", role: .cancel) {}
+                    Button("再打印一次") { model.doPrint() }
+                } message: {
+                    Text("这批文件已经提交过。继续将按当前设置再次提交全部文件，可能产生重复打印。")
+                }
             }
         }
         .padding(.horizontal, 16)
