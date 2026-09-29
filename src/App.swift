@@ -292,6 +292,66 @@ let SOFFICE_CANDIDATES = ["/Applications/LibreOffice.app/Contents/MacOS/soffice"
 func isOfficeFile(_ u: URL) -> Bool { OFFICE_EXTS.contains(u.pathExtension.lowercased()) }
 func sofficePath() -> String? { SOFFICE_CANDIDATES.first { FileManager.default.isExecutableFile(atPath: $0) } }
 
+let BREW_CANDIDATES = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]
+func brewPath() -> String? { BREW_CANDIDATES.first { FileManager.default.isExecutableFile(atPath: $0) } }
+
+/// 官方源解析最新版 LibreOffice：/stable/ 列目录取最高版本号，
+/// 主 DMG 多语言（无需 langpack）。架构分 aarch64 / x86-64。
+func latestLibreOfficeURL() async -> URL? {
+    let arch = (try? runCmdOut("/usr/bin/uname", ["-m"])) ?? "arm64"
+    let isArm = arch.trimmingCharacters(in: .whitespaces) == "arm64"
+    guard let listing = try? await fetchData(from: "https://download.documentfoundation.org/libreoffice/stable/"),
+          let html = String(data: listing, encoding: .utf8) else { return nil }
+    let versions = html.split(separator: "\"").compactMap { seg -> String? in
+        guard let r = seg.range(of: "^[0-9]+\\.[0-9]+\\.[0-9]+/$", options: .regularExpression) else { return nil }
+        return String(seg[r].dropLast())
+    }.sorted { a, b in
+        let pa = a.split(separator: ".").compactMap { Int($0) }, pb = b.split(separator: ".").compactMap { Int($0) }
+        for i in 0..<3 where pa[i] != pb[i] { return pa[i] < pb[i] }
+        return false
+    }
+    guard let v = versions.last else { return nil }
+    let suffix = isArm ? "aarch64" : "x86-64"
+    return URL(string: "https://download.documentfoundation.org/libreoffice/stable/\(v)/mac/\(suffix)/LibreOffice_\(v)_MacOS_\(suffix).dmg")
+}
+
+func fetchData(from u: String) async throws -> Data {
+    let (d, _) = try await URLSession.shared.data(from: URL(string: u)!)
+    return d
+}
+
+/// 带进度的下载（大文件用）：进度回调在主线程外的队列里，调用方自己跳主线程
+func downloadWithProgress(_ src: URL, to dest: URL, progress: @escaping (Double) -> Void) async throws {
+    let (bytes, response) = try await URLSession.shared.bytes(from: src)
+    let total = Double(response.expectedContentLength)
+    FileManager.default.createFile(atPath: dest.path, contents: nil)
+    let fh = try FileHandle(forWritingTo: dest)
+    defer { try? fh.close() }
+    var got: Double = 0
+    var buf = Data()
+    for try await b in bytes {
+        buf.append(b)
+        got += 1
+        if buf.count >= 1 << 16 {
+            try fh.write(contentsOf: buf)
+            buf.removeAll(keepingCapacity: true)
+            if total > 0 { progress(got / total) }
+        }
+        try Task.checkCancellation()
+    }
+    if !buf.isEmpty { try fh.write(contentsOf: buf) }
+    progress(1.0)
+}
+
+func runCmdOut(_ path: String, _ args: [String]) throws -> String {
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: path)
+    p.arguments = args
+    let pipe = Pipe(); p.standardOutput = pipe; p.standardError = pipe
+    try p.run(); p.waitUntilExit()
+    return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+}
+
 func officeCacheDir() -> URL {
     let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
         ?? URL(fileURLWithPath: NSTemporaryDirectory())
@@ -472,6 +532,10 @@ final class Model: ObservableObject {
     @Published var reach: ReachState = .unknown
     /// 加过 Office/文本文件但本机没有 LibreOffice：提示一次 + 引导安装
     @Published var missingLibreOffice = false
+    /// LibreOffice 一键安装中（下载/拷贝阶段）：底栏显示进度，禁止重复触发
+    @Published var loInstallPercent: Double? = nil
+    private var sofficePollTimer: Timer?
+    private var loInstallTask: Task<Void, Never>?
     /// 已保存的启动默认缩放（「设为默认」存进来的）；nil = 从未存过
     @Published var savedScaleMode: ScaleMode?
     @Published var savedScalePercent: Double = 80
@@ -493,6 +557,7 @@ final class Model: ObservableObject {
         }
         // 快照钩子：预置 LibreOffice 缺失态，验证底栏引导链接
         if ProcessInfo.processInfo.environment["BATCHPRINT_NO_SOFFICE"] == "1" { missingLibreOffice = true }
+        startSofficePollIfNeeded()
         let r = listPrinters()
         printers = r.names
         printer = r.def ?? r.names.first ?? ""
@@ -524,6 +589,83 @@ final class Model: ObservableObject {
     }
 
     /// 可达性检测：串行去重，切打印机/手动重检都会走这里
+    // LibreOffice 缺失时轮询：覆盖 Terminal 安装/手动安装，装好自动清状态。开销 = 3 次 exists 检查
+    private func startSofficePollIfNeeded() {
+        guard sofficePollTimer == nil, missingLibreOffice else { return }
+        sofficePollTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self, self.missingLibreOffice, sofficePath() != nil else { return }
+                self.missingLibreOffice = false
+                self.sofficePollTimer?.invalidate(); self.sofficePollTimer = nil
+                self.flash("LibreOffice 已就绪，Office/文本文件现在可以打印了")
+            }
+        }
+    }
+
+    /// 一键安装：有 brew → Terminal 里跑 cask（进度透明）；没 brew → 官方源下载 DMG + 自动挂载拷贝。
+    /// 任一步失败 → 回退打开官网下载页。
+    func installLibreOffice() {
+        guard loInstallPercent == nil, missingLibreOffice else { return }
+        if let brew = brewPath() {
+            let s = "brew install --cask libreoffice"
+            let ok = NSAppleScript(source: "tell application \"Terminal\" to do script \"\(s)\"")!.executeAndReturnError(nil) != nil
+            if ok {
+                flash("已在 Terminal 开始安装 LibreOffice（约 350MB），完成后这里会自动更新", seconds: 6)
+                startSofficePollIfNeeded()
+            } else {
+                flash("无法打开 Terminal，请手动安装：\(s)", seconds: 8)
+            }
+            return
+        }
+        loInstallTask = Task { @MainActor in
+            loInstallPercent = 0
+            flash("正在获取 LibreOffice 最新版本…")
+            guard let dmg = await latestLibreOfficeURL() else {
+                loInstallPercent = nil
+                NSWorkspace.shared.open(URL(string: "https://www.libreoffice.org/download/download-libreoffice/")!)
+                flash("无法解析官方源，已打开官网下载页")
+                return
+            }
+            // 下载到 ~/Downloads（用户可留存；自动清理反而不友好）
+            let dest = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Downloads/\(dmg.lastPathComponent)")
+            do {
+                try await downloadWithProgress(dmg, to: dest) { pct in
+                    Task { @MainActor in self.loInstallPercent = pct }
+                }
+            } catch {
+                loInstallPercent = nil
+                NSWorkspace.shared.open(URL(string: "https://www.libreoffice.org/download/download-libreoffice/")!)
+                flash("下载失败（\(error.localizedDescription)），已打开官网下载页", seconds: 6)
+                return
+            }
+            // 挂载 → 拷到 /Applications → 卸载。/Applications 不可写（非 admin）时退回打开 DMG 让用户拖
+            let appsWritable = FileManager.default.isWritableFile(atPath: "/Applications")
+            let mountOut = runCmd("/usr/bin/hdiutil", ["attach", "-nobrowse", "-plist", dest.path])
+            let mountPoint = mountOut.range(of: "<string>/Volumes/[^<]+</string>")
+                .map { String(mountOut[$0].replacingOccurrences(of: "<string>", with: "").replacingOccurrences(of: "</string>", with: "")) }
+            if appsWritable, let mp = mountPoint,
+               runCmd("/bin/cp", ["-R", "\(mp)/LibreOffice.app", "/Applications/"]).isEmpty {
+                _ = runCmd("/usr/bin/hdiutil", ["detach", mp, "-quiet"])
+                loInstallPercent = nil
+                flash("LibreOffice 安装完成")
+            } else {
+                if let mp = mountPoint { NSWorkspace.shared.open(URL(fileURLWithPath: mp)) }
+                else { NSWorkspace.shared.open(dest) }
+                loInstallPercent = nil
+                flash("已下载。请把 LibreOffice.app 拖进 Applications 文件夹（或等待 Terminal 安装完成）", seconds: 8)
+            }
+            startSofficePollIfNeeded()
+        }
+    }
+
+    func cancelLOInstall() {
+        loInstallTask?.cancel()
+        loInstallTask = nil
+        loInstallPercent = nil
+        flash("已取消 LibreOffice 下载")
+    }
+
     func checkReach() {
         reachTask?.cancel()
         let uri = printerURIs[printer]
@@ -572,8 +714,9 @@ final class Model: ObservableObject {
         // 而不是等到渲染时静默跳过（用户只会看到「文件打不出来」却不知道原因）。
         let hasOffice = urls.contains { isOfficeFile($0) }
         if hasOffice, sofficePath() == nil {
-            flash("缺少 LibreOffice：Office/文本文件无法转换。brew install --cask libreoffice 或官网下载", seconds: 8)
+            flash("缺少 LibreOffice：点底栏「安装 LibreOffice…」一键安装", seconds: 6)
             missingLibreOffice = true
+            startSofficePollIfNeeded()
         }
         let needConvert = hasOffice
         if needConvert, sofficePath() != nil { busy = true; message = "正在用 LibreOffice 转换文档…" }
@@ -1919,6 +2062,7 @@ struct PreviewPane: View {
 struct BottomBar: View {
     @ObservedObject var model: Model
     @State private var askReprint = false
+    @State private var askInstallLO = false
 
     /// 这批文件是否刚全部发送过（没改过任何东西）→ 再点打印是「重打」，先确认
     private var isReprint: Bool {
@@ -1982,15 +2126,31 @@ struct BottomBar: View {
                     Label("取消剩余", systemImage: "stop.fill")
                 }
             } else {
-                if model.missingLibreOffice {
-                    Button("安装 LibreOffice…") {
-                        NSWorkspace.shared.open(URL(string: "https://www.libreoffice.org/download/download-libreoffice/")!)
-                    }
-                    .buttonStyle(.link)
-                    .font(.system(size: 11))
-                    .controlSize(.small)
-                    .foregroundStyle(Color.primary.opacity(0.72))
-                    .help("Office/文本文件需要 LibreOffice 转换。也可 brew install --cask libreoffice")
+                if model.loInstallPercent != nil {
+                    Text("· 下载 LibreOffice \(Int(model.loInstallPercent ?? 0))%")
+                        .font(.system(size: 12).monospacedDigit())
+                        .foregroundStyle(.secondary)
+                    Button("取消") { model.cancelLOInstall() }
+                        .buttonStyle(.link)
+                        .font(.system(size: 11))
+                        .controlSize(.small)
+                        .foregroundStyle(Color.primary.opacity(0.72))
+                } else if model.missingLibreOffice {
+                    Button("安装 LibreOffice…") { askInstallLO = true }
+                        .buttonStyle(.link)
+                        .font(.system(size: 11))
+                        .controlSize(.small)
+                        .foregroundStyle(Color.primary.opacity(0.72))
+                        .help("一键安装：\(brewPath() != nil ? "用 Homebrew 安装（在 Terminal 里跑，进度可见）" : "从官方源下载最新版并自动装入 Applications")")
+                        .alert(brewPath() != nil ? "用 Homebrew 安装 LibreOffice？" : "下载并安装 LibreOffice？",
+                               isPresented: $askInstallLO) {
+                            Button("取消", role: .cancel) {}
+                            Button("安装") { model.installLibreOffice() }
+                        } message: {
+                            Text(brewPath() != nil
+                                 ? "约 350MB，将执行 brew install --cask libreoffice（Terminal 里跑，进度可见），完成后这里会自动更新。"
+                                 : "约 350MB，自动下载官方最新 DMG 并拷入 Applications，完成后这里会自动更新。")
+                        }
                 }
                 if hasSent {
                     HoverButton(tip: "从列表移除已发送的文件（失败/已取消保留）") {
