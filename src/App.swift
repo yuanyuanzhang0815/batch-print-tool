@@ -1155,6 +1155,7 @@ struct FileTable: View {
     let reduce: Bool
     var targeted = false
     let nameWidth: CGFloat
+    @State private var askClearLive = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1162,9 +1163,21 @@ struct FileTable: View {
                 paneTitle("文件队列")
                 Spacer()
                 HoverButton(tip: "清空文件队列", off: model.items.isEmpty) {
-                    withAnimation(motion(reduce)) { model.clear() }
+                    if !model.items.filter({ $0.status.isLive }).isEmpty {
+                        askClearLive = true
+                    } else {
+                        withAnimation(motion(reduce)) { model.clear() }
+                    }
                 } label: {
                     Text("清空")
+                }
+                // 「清空」的语义升级：还有 job 在跑时，它不再只是删列表，还会取消真实任务。
+                // 行为语义变化值一次确认。
+                .alert("清空并取消打印任务？", isPresented: $askClearLive) {
+                    Button("取消", role: .cancel) {}
+                    Button("清空并取消任务") { withAnimation(motion(reduce)) { model.clear() } }
+                } message: {
+                    Text("当前还有 \(model.items.filter { $0.status.isLive }.count) 个打印任务未完成。清空列表会同时取消这些任务。")
                 }
 
                 HoverButton(tip: "添加文件（⌘O，可多选，也可选文件夹）") {
@@ -1419,8 +1432,9 @@ struct FileRow: View {
             ZStack {
                 Color.clear
                 if item.status.isLive {
-                    RailButton(sys: "stop.fill", tip: "取消此文件的打印任务",
-                               tint: Color(red: 0.85, green: 0.53, blue: 0.08)) {
+                    // 取消是可用操作不是状态灯：默认灰、hover 提对比，不长期上色
+                    // （否则一列橙方块看着像「这些行有异常」，反而淹没了真正的红「失败」）
+                    RailButton(sys: "stop.fill", tip: "取消此文件的打印任务") {
                         model.cancelJob(item)
                     }
                 } else if hl {
@@ -1923,7 +1937,7 @@ struct BottomBar: View {
             if liveCount > 0 {
                 Text("· \(liveCount) 个任务队列中")
                     .font(.system(size: 12))
-                    .foregroundStyle(Color(red: 0.85, green: 0.53, blue: 0.08))
+                    .foregroundStyle(.secondary)
                     .transition(.opacity)
             } else if hasSent, model.message.isEmpty {
                 Text("· 已全部发送")
