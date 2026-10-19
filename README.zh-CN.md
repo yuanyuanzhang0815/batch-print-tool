@@ -10,7 +10,7 @@ macOS 原生（SwiftUI）批量打印小工具：把一堆文件丢进去，按�
 
 ## 功能
 
-- **多文件类型**：PDF、图片（PNG / JPG / JPEG / TIFF / GIF / BMP / HEIC / HEIF / WEBP）、Office 与文本（doc docx xls xlsx ppt pptx odt ods odp rtf txt csv）
+- **多文件类型**：PDF、图片（PNG / JPG / JPEG / TIFF / GIF / BMP / HEIC / HEIF / WEBP）、Office 与文本（doc docx xls xlsx ppt pptx odt ods odp rtf txt csv），以及 **OFD**（数电票 / 电子行程单，加入时自动转成 PDF）
 - **加文件只有一个入口**：拖拽 / `⌘O` / 空状态和顶部的「添加文件」。同一个面板里**文件和文件夹都能选**（选文件夹就把它里面支持的文件一次全加进来）
 - **统一缩放**：实际大小 / 适合页面 / 自定义比例（滑块 50–100%）
 - **纸张与页边距**：A4 / Letter / A5；页边距 无 / 居中
@@ -29,6 +29,7 @@ macOS 原生（SwiftUI）批量打印小工具：把一堆文件丢进去，按�
 - macOS 26（Tahoe）及以上 —— 使用了 `containerBackground` / `glassEffect` 等新 API
 - Apple Silicon（构建目标 arm64）
 - 可选：LibreOffice（仅当需要打印 Office / 文本类文件时；路径 `/Applications/LibreOffice.app` 或 `soffice` 在 PATH）
+- 可选：`ofd2pdf`（仅当需要打印 OFD 时；在 PATH 或 `~/.local/bin/ofd2pdf`）。macOS 没有原生 OFD 支持，app 会调用它转成 PDF；没装就把该文件**明确报为跳过**，不再静默消失
 
 ## 安装
 
@@ -67,6 +68,7 @@ macOS 原生（SwiftUI）批量打印小工具：把一堆文件丢进去，按�
 - **会「出现/消失」的元素会推开旁边可点的按钮**：预览头部原本是一个「↻90° · 复位」文字按钮，有旋转才出现。结果每转一次，旁边的 ↺ ↻ 就被推走一段，而鼠标正停在按钮上（连续点必然点错）。修法：**不是删元素，而是把会变的东西换成固定占位的图标** —— 复位改成第三个图标按钮，未旋转时只是发淡+禁用，位置永远不变。以后任何「状态文字」想进工具栏，都先问：它出现/消失时会推动可点区域吗。
 - **旋转不另开分支**：先把内容外接盒按 90°/270° 换成宽高互换的盒子，缩放 / 纸张 / 页边距三套规则照常作用于这个盒子，绘制时再绕盒子中心旋转、并按原内容中心回移（`rotatedBox` / `placeContent`）。导出、打印、预览三条路径共用一份数学，不会出现「预览转了导出的没转」。实测四角度在纸上均居中（偏移 ≤2px），90° 后内容宽高比精确为原图倒数。
 - **图片不是另一条流水线**：图片按 DPI 元数据换算成点尺寸后，用与 PDF **完全相同**的缩放/纸张/页边距数学画进 PDF，所以行为一致、只有一套逻辑。
+- **OFD 转换**：和 Office 走同一思路 —— 加入时同步转成 PDF 放进 `$TMPDIR/print-tools-ofd/`（按 mtime 复用），转出来的 PDF 进入完全相同的缩放/打印流水线，所以上层逻辑零改动。`ofd2pdf` 是外部命令（见 `~/Desktop/CLAUDE/ofd-tools`），macOS 启动的 app 拿不到登录 shell 的 PATH，所以除了 PATH 还写死了 `~/.local/bin`、`/opt/homebrew/bin`、`/usr/local/bin` 三个位置。
 - **Office 转换**：`soffice --headless --convert-to pdf`，按「转换器版本 + 路径 + mtime」缓存到 `~/Library/Caches/local.printtools.batchprint/office/`。
 - **LibreOffice 中文乱码**：headless 模式下它在本机的字体发现是坏的（找不到系统 CJK 字体，中文渲染成空白/方块）。修法是注入一份指向 `/System/Library/Fonts` 的 `FONTCONFIG_FILE`，见 `ensureFontConfig()`。
 - **渲染必须全部走同一个串行后台队列**（`renderQueue` / `renderOffMain` / `BatchPlan`）：

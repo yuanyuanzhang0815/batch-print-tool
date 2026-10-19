@@ -13,8 +13,9 @@ bound, centered on A4, and filenames that stay readable while you check the list
 
 ## What it does
 
-- **One queue, many formats** — PDF, images (PNG / JPG / JPEG / TIFF / GIF / BMP / HEIC / HEIF / WEBP)
-  and Office or text files (doc/docx, xls/xlsx, ppt/pptx, odt/ods/odp, rtf, txt, csv).
+- **One queue, many formats** — PDF, images (PNG / JPG / JPEG / TIFF / GIF / BMP / HEIC / HEIF / WEBP),
+  Office or text files (doc/docx, xls/xlsx, ppt/pptx, odt/ods/odp, rtf, txt, csv), and **OFD**
+  (Chinese e-invoices / flight itineraries) converted to PDF on the way in.
 - **One set of rules** — scale (fit / actual size / custom 50–100%), paper (A4 / Letter / A5),
   margins, duplex.
 - **Per-file overrides** — page range, copies, and rotation, each file on its own.
@@ -32,6 +33,9 @@ More states: [`screenshots/`](screenshots) — default, hover, rotated, changed 
 - **Apple Silicon.** The build target is `arm64-apple-macos26.0`; Intel isn't tested.
 - Optional: **LibreOffice**, only if you want to print Office or text files. Without it those
   files are skipped when you add them.
+- Optional: **`ofd2pdf`** on your `PATH` (or at `~/.local/bin/ofd2pdf`), only if you want to print OFD
+  files. macOS has no native OFD support, so the app shells out to that converter; without it OFD
+  files are reported as skipped instead of silently disappearing.
 
 ## Install
 

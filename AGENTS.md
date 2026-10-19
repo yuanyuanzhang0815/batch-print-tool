@@ -8,11 +8,18 @@ macOS 原生批量打印小工具（SwiftUI，单文件实现）。把一堆文�
 
 ## 状态
 
-- **v1.3**，已开源（2026-09-24）。DMG / ZIP 挂在 GitHub Release `v1.3` 上
+- **v1.6**（2026-10-19）：加入 **OFD 支持** —— 拖入 `.ofd`（数电票 / 电子行程单）时调用外部 `ofd2pdf` 转成 PDF 再加入队列；不支持的文件不再静默跳过，底栏会显示「跳过 N 个不支持的文件」可点开看清单
+- **v1.5 / v1.4 / v1.3**：更早的发布，DMG / ZIP 挂在对应 GitHub Release 上
 - 单仓库：这里既是开发仓库也是发布仓库，没有第二个快照仓库了
 - 上次合并：原公开发布仓库 `macos-batch-print` 的内容（LICENSE、screenshots、英文 README、AGENTS.md）已并入本仓库，那个仓库随后归档
 
 ## 关键事实与决策
+
+- **OFD 靠外部命令，不内嵌运行时**。macOS 没有原生 OFD 支持；把 Java（ofdrw）+ JRE 打进 app 会让分发包涨 80MB+。所以走「检测 `ofd2pdf` → 调用 → 失败就明确报告」这条路，和已有 LibreOffice 的处理方式一致。转换器本体在 `~/Desktop/CLAUDE/ofd-tools`
+- **`isSupportedFile` 不包含 ofd**（渲染器确实不支持），ofd 在 `add()` 里先转成 PDF 再入队 —— 这样上层预览/缩放/打印整套逻辑一行都不用改
+- **`isOFDFile` 判断 + `ofdToPDF` 放 `$TMPDIR/print-tools-ofd/`，按 mtime 复用**：同一份 OFD 反复拖进来不会重复转换
+- **GUI 启动的 app 拿不到登录 shell 的 PATH** → `ofd2pdfPath()` 除了查 PATH，还写死 `~/.local/bin`、`/opt/homebrew/bin`、`/usr/local/bin`，并支持 `OFD2PDF` 环境变量覆盖
+- **不支持的文件必须让用户看见**：`add()` 收集 `skippedUnsupported`，底栏显示「跳过 N 个不支持的文件」+ alert 列表。之前是 `guard ... else { continue }` 静默吞掉，用户只会觉得「文件没进去」
 
 - **本仓库既是开发仓库也是发布仓库**。曾经分成「私有开发仓库 print-tools + 公开发布快照 macos-batch-print」，2026-09-24 合并为一个，原因：两边 `src/App.swift` 完全相同，维护两份必然漂移
 - 仓库名是 `batch-print-tool`，但 app 名和 bundle 名是 `批量打印工具` / `BatchPrint`，产物路径 `dist/批量打印工具.app`
