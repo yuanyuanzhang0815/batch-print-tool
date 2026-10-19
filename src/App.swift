@@ -292,6 +292,62 @@ let SOFFICE_CANDIDATES = ["/Applications/LibreOffice.app/Contents/MacOS/soffice"
 func isOfficeFile(_ u: URL) -> Bool { OFFICE_EXTS.contains(u.pathExtension.lowercased()) }
 func sofficePath() -> String? { SOFFICE_CANDIDATES.first { FileManager.default.isExecutableFile(atPath: $0) } }
 
+// ── OFD（国标数电票 / 电子行程单）：靠外部 ofd2pdf 转成 PDF ─────────
+// macOS 没有原生 OFD 支持，自己写渲染器不现实；转换器在 ~/Desktop/CLAUDE/ofd-tools
+// （ofdrw + 中文字体替换），装好后是一个 `ofd2pdf` 命令。
+func isOFDFile(_ u: URL) -> Bool { u.pathExtension.lowercased() == "ofd" }
+
+let OFD2PDF_CANDIDATES: [String] = [
+    NSString(string: "~/.local/bin/ofd2pdf").expandingTildeInPath,
+    "/opt/homebrew/bin/ofd2pdf",
+    "/usr/local/bin/ofd2pdf",
+]
+
+/// GUI 启动的 app 拿不到登录 shell 的 PATH，所以除了 PATH 还要写死几个常见位置
+func ofd2pdfPath() -> String? {
+    let env = ProcessInfo.processInfo.environment
+    if let p = env["OFD2PDF"], FileManager.default.isExecutableFile(atPath: p) { return p }
+    if let p = OFD2PDF_CANDIDATES.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) { return p }
+    for dir in (env["PATH"] ?? "").split(separator: ":") {
+        let cand = "\(dir)/ofd2pdf"
+        if FileManager.default.isExecutableFile(atPath: cand) { return cand }
+    }
+    return nil
+}
+
+/// 把 OFD 转成 PDF（放临时目录），失败返回 nil
+func ofdToPDF(_ u: URL) -> URL? {
+    guard let tool = ofd2pdfPath() else { return nil }
+    let outDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("print-tools-ofd", isDirectory: true)
+    try? FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
+    let out = outDir.appendingPathComponent(u.deletingPathExtension().lastPathComponent + ".pdf")
+    // 已有更新的转换结果就直接复用（同一份 OFD 反复拖进来不用重转）
+    let fm = FileManager.default
+    if let oa = try? fm.attributesOfItem(atPath: out.path), let ia = try? fm.attributesOfItem(atPath: u.path),
+       let od = oa[.modificationDate] as? Date, let id = ia[.modificationDate] as? Date, od >= id {
+        return out
+    }
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: tool)
+    p.arguments = ["-o", out.path, u.path]
+    let err = Pipe()
+    p.standardOutput = Pipe()
+    p.standardError = err
+    do {
+        try p.run()
+        p.waitUntilExit()
+        guard p.terminationStatus == 0, fm.fileExists(atPath: out.path) else {
+            let msg = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            NSLog("ofd2pdf 失败(%d): %@", p.terminationStatus, msg)
+            return nil
+        }
+        return out
+    } catch {
+        NSLog("ofd2pdf 启动失败: %@", error.localizedDescription)
+        return nil
+    }
+}
+
 let BREW_CANDIDATES = ["/opt/homebrew/bin/brew", "/usr/local/bin/brew"]
 func brewPath() -> String? { BREW_CANDIDATES.first { FileManager.default.isExecutableFile(atPath: $0) } }
 
@@ -532,6 +588,8 @@ final class Model: ObservableObject {
     @Published var reach: ReachState = .unknown
     /// 加过 Office/文本文件但本机没有 LibreOffice：提示一次 + 引导安装
     @Published var missingLibreOffice = false
+    /// 本次添加里被跳过的文件（不支持 / OFD 转换失败）——必须让用户看见，不能静默吞掉
+    @Published var skippedUnsupported: [String] = []
     /// LibreOffice 一键安装中（下载/拷贝阶段）：底栏显示进度，禁止重复触发
     @Published var loInstallPercent: Double? = nil
     private var sofficePollTimer: Timer?
@@ -722,22 +780,46 @@ final class Model: ObservableObject {
         if needConvert, sofficePath() != nil { busy = true; message = "正在用 LibreOffice 转换文档…" }
         defer { if needConvert, sofficePath() != nil { busy = false } }
         var added: [PrintItem] = []
+        var skipped: [String] = []      // 不支持 / 转换失败的文件，最后必须明确告诉用户
+        var ofdConverted = 0
+
+        // 把一个候选文件变成「可打印的文件」：OFD 走 ofd2pdf 转 PDF，其余原样返回
+        func resolve(_ f: URL) -> URL? {
+            if isOFDFile(f) {
+                if let pdf = ofdToPDF(f) { ofdConverted += 1; return pdf }
+                skipped.append("\(f.lastPathComponent)（OFD：没找到 ofd2pdf 或转换失败）")
+                return nil
+            }
+            guard isSupportedFile(f) else { skipped.append(f.lastPathComponent); return nil }
+            return f
+        }
+
         for u in urls {
             var isDir: ObjCBool = false
             if FileManager.default.fileExists(atPath: u.path, isDirectory: &isDir), isDir.boolValue {
                 let inner = (try? FileManager.default.contentsOfDirectory(at: u, includingPropertiesForKeys: nil)) ?? []
-                for f in inner.sorted(by: { $0.lastPathComponent < $1.lastPathComponent })
-                where isSupportedFile(f) && !items.contains(where: { $0.url == f }) {
-                    added.append(PrintItem(url: f, pages: pageCount(f)))
+                for f in inner.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+                    guard let r = resolve(f) else { continue }
+                    if items.contains(where: { $0.url == r }) { continue }
+                    added.append(PrintItem(url: r, pages: pageCount(r)))
                 }
                 continue
             }
-            guard isSupportedFile(u) else { continue }
-            if items.contains(where: { $0.url == u }) { continue }
-            added.append(PrintItem(url: u, pages: pageCount(u)))
+            guard let r = resolve(u) else { continue }
+            if items.contains(where: { $0.url == r }) { continue }
+            added.append(PrintItem(url: r, pages: pageCount(r)))
         }
+
+        skippedUnsupported = skipped
+        if !skipped.isEmpty { NSLog("跳过 %d 个文件: %@", skipped.count, skipped.joined(separator: ", ")) }
+        if ofdConverted > 0 { NSLog("已把 %d 个 OFD 转成 PDF", ofdConverted) }
+
         guard !added.isEmpty else {
-            flash("没有新的文件可加（可能已在队列里）")
+            if !skipped.isEmpty {
+                flash("没有可打印的文件：\(skipped.count) 个文件不支持（右下角可查看）", seconds: 6)
+            } else {
+                flash("没有新的文件可加（可能已在队列里）")
+            }
             return
         }
         items.append(contentsOf: added)
@@ -1262,7 +1344,8 @@ struct ContentView: View {
             guard let d = sampleDir else { return }
             let dir = URL(fileURLWithPath: d)
             let inner = (try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)) ?? []
-            let files = inner.filter { isSupportedFile($0) }
+            // 不做预过滤：支持性判断统一交给 model.add()，这样演示目录也能覆盖「跳过不支持文件」的路径
+            let files = inner.sorted { $0.lastPathComponent < $1.lastPathComponent }
                 .sorted { $0.lastPathComponent < $1.lastPathComponent }
             if !files.isEmpty { model.add(files) }
             if ProcessInfo.processInfo.environment["BATCHPRINT_DEMO"] == "stress", model.items.count > 1 {
@@ -1416,6 +1499,8 @@ struct FileTable: View {
         p.canChooseDirectories = true
         var types: [UTType] = [.pdf, .image]
         for e in OFFICE_EXTS { if let t = UTType(filenameExtension: e) { types.append(t) } }
+        // OFD（数电票 / 电子行程单）也要能选：加进来时靠 ofd2pdf 转成 PDF
+        if let t = UTType(filenameExtension: "ofd") { types.append(t) }
         p.allowedContentTypes = types
         let r = p.runModal()
         resetCursorRects()
@@ -2063,6 +2148,7 @@ struct BottomBar: View {
     @ObservedObject var model: Model
     @State private var askReprint = false
     @State private var askInstallLO = false
+    @State private var askSkipped = false
 
     /// 这批文件是否刚全部发送过（没改过任何东西）→ 再点打印是「重打」，先确认
     private var isReprint: Bool {
@@ -2150,6 +2236,18 @@ struct BottomBar: View {
                             Text(brewPath() != nil
                                  ? "约 350MB，将执行 brew install --cask libreoffice（Terminal 里跑，进度可见），完成后这里会自动更新。"
                                  : "约 350MB，自动下载官方最新 DMG 并拷入 Applications，完成后这里会自动更新。")
+                        }
+                } else if !model.skippedUnsupported.isEmpty {
+                    Button("跳过 \(model.skippedUnsupported.count) 个不支持的文件") { askSkipped = true }
+                        .buttonStyle(.link)
+                        .font(.system(size: 11))
+                        .controlSize(.small)
+                        .foregroundStyle(Color.primary.opacity(0.72))
+                        .help(model.skippedUnsupported.joined(separator: "\n"))
+                        .alert("这些文件没有加入队列", isPresented: $askSkipped) {
+                            Button("知道了", role: .cancel) {}
+                        } message: {
+                            Text(model.skippedUnsupported.joined(separator: "\n"))
                         }
                 }
                 if hasSent {
